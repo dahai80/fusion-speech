@@ -19,9 +19,9 @@ local filesystem. Peer-UID verified so only same-user processes may call the dae
 
 One long-running asyncio daemon: `python3 -m fusion_speech.server`.
 
-- **HTTP server** (uvicorn) on `127.0.0.1:11465` — `/health` only (M0). Used by
-  `start.sh doctor` and external liveness checks. Will host streaming WebSocket
-  endpoints in M2/M4 for non-UDS clients.
+- **HTTP server** (uvicorn) on `127.0.0.1:11465` — `/health` (M0) plus the
+  `/stream/stt` WebSocket (M2, reused by M4) for non-UDS realtime clients. Used
+  by `start.sh doctor` and external liveness checks.
 - **UDS server** (`asyncio.start_unix_server`) at `~/.fusion-speech/run/fusion-speech.sock`
   (mode 0o600, dir 0o700) — newline-delimited JSON-RPC 2.0. Primary control plane.
 - **Startup probe** — `probe_mlx_audio_lane` hits fusion-mlx `/v1/models`, checks
@@ -283,7 +283,8 @@ speech.speak ─▶ mlx_bridge.synthesize_stream ─▶ StreamingPlayer ─▶ s
    (RPC)        (POST /v1/audio/speech stream)  (fetch→resample→queue→writer)  (started on first chunk)
 ```
 
-The daemon owns the `sounddevice.OutputStream`. `tts_playback.StreamingPlayer`
+The daemon owns the `StreamingPlayer`, which in turn owns the
+`sounddevice.OutputStream`. `tts_playback.StreamingPlayer`
 runs the pipeline: fetch PCM chunks from `mlx_bridge.synthesize_stream` →
 resample 24k→16k → push into a bounded queue → a writer task drains the queue
 into the `OutputStream`. The stream is started on the first chunk, so

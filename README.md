@@ -225,7 +225,8 @@ Milestone progress:
     pending + closes the stream. Fail-soft on device error.
   - Mic guard: while speaking, wake paused; if ASR was listening, stopped then
     restarted — no self-trigger, no echo. Reuses M2/M3 primitives.
-  - RPC: `speech.speak`, `speech.stop_tts`; `speech.tts` events (starting/speaking/done/cancelled/error) on `/stream/stt`.
+  - RPC: `speech.speak`, `speech.stop_tts`; `speech.tts` events
+    (starting/speaking/done/cancelled/error) on `/stream/stt`.
   - Verified: ~80+ tests green incl. real-load (Kokoro via fusion-mlx, fake output, headless).
 - **M5** — fusion-studio integration (upstream issue/PR)
 - **M6** — tests, integration, docs
