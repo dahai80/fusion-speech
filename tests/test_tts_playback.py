@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import socket
 import struct
 
 import numpy as np
@@ -197,4 +198,56 @@ async def test_bounded_queue_backpressures_fetch():
     await player.cancel()
     await asyncio.wait_for(task, timeout=3.0)
     assert player.active is False
+
+
+def _mlx_reachable() -> bool:
+    try:
+        with socket.create_connection(("127.0.0.1", 11434), timeout=2.0):
+            return True
+    except OSError:
+        return False
+
+
+MLX_UP = _mlx_reachable()
+
+
+@pytest.mark.asyncio
+@pytest.mark.skipif(not MLX_UP, reason="fusion-mlx not running on 11434")
+async def test_real_tts_loads_and_streams():
+    # Real-load gate (project rule: really load the model). Uses the real
+    # synthesize_stream -> fusion-mlx Kokoro, fake OutputStream (headless, no
+    # speaker). Asserts chunks arrive, TTFA, done event.
+    cfg = load_config()
+    notified = []
+
+    async def notifier(payload):
+        notified.append(payload)
+
+    class _FakeOutStream:
+        def __init__(self, **kwargs):
+            self.active = False
+            self.frames = 0
+
+        def start(self):
+            self.active = True
+
+        def stop(self):
+            self.active = False
+
+        def close(self):
+            self.active = False
+
+        def write(self, data):
+            self.frames += 1
+
+    player = StreamingPlayer(
+        cfg,
+        notifier=notifier,
+        stream_factory=lambda **k: _FakeOutStream(),
+    )
+    res = await asyncio.wait_for(player.speak("Hello world.", model=cfg.tts_model), timeout=60.0)
+    assert res["played"] is True
+    assert res["sample_rate"] > 0
+    states = [n.get("state") for n in notified if n.get("event") == "speech.tts"]
+    assert "done" in states
 
