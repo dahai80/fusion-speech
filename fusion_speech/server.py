@@ -30,6 +30,8 @@ class SpeechDaemon:
         self.hotwords: list[str] = []
         self.wake_armed = False
         self._wake = None  # WakeWordEngine, lazily built
+        self.speaking = False
+        self._player = None  # StreamingPlayer, lazily built
         self._server: asyncio.Server | None = None
         self._app: FastAPI | None = None
         self._http_task: asyncio.Task | None = None
@@ -119,6 +121,39 @@ class SpeechDaemon:
         result = await wake.stop()
         self._wake = None
         return result
+
+    async def speak(self, text: str, voice: str = "", model: str = "") -> dict:
+        from fusion_speech.tts_playback import StreamingPlayer
+
+        if self._player is not None and self._player.active:
+            return {"played": False, "error": "already speaking"}
+        player = StreamingPlayer(self.config, notifier=self.broadcast)
+        self._player = player
+        wake = self._wake
+        was_listening = self._listener is not None and self._listener.active
+        if wake is not None and wake.active and not wake.paused:
+            wake.pause()
+        if was_listening:
+            with contextlib.suppress(Exception):
+                await self.stop_listening()
+        try:
+            self.speaking = True
+            result = await player.speak(text, voice=voice, model=model)
+        finally:
+            self.speaking = False
+            self._player = None
+            if wake is not None and wake.active and wake.paused:
+                wake.resume()
+            if was_listening:
+                with contextlib.suppress(Exception):
+                    await self.start_listening()
+        return result
+
+    async def stop_tts(self) -> dict:
+        player = self._player
+        if player is None:
+            return {"stopped": False}
+        return await player.cancel()
 
     def set_hotwords(self, words: list[str]) -> list[str]:
         if self._wake is None:
@@ -247,6 +282,11 @@ class SpeechDaemon:
 
     async def stop(self) -> None:
         self.running = False
+        if self._player is not None:
+            with contextlib.suppress(Exception):
+                await self._player.cancel()
+            self._player = None
+            self.speaking = False
         if self._wake is not None:
             with contextlib.suppress(Exception):
                 await self._wake.stop()
