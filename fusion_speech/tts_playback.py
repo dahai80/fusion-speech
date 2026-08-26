@@ -64,6 +64,11 @@ class StreamingPlayer:
             await asyncio.gather(self._fetch_task, self._write_task)
         except Exception as e:
             logger.warning("speak failed: %s", e)
+            self._cancelled = True
+            for task in (self._fetch_task, self._write_task):
+                if task is not None and not task.done():
+                    task.cancel()
+            await asyncio.gather(self._fetch_task, self._write_task, return_exceptions=True)
             await self._notify({"event": "speech.tts", "state": "error", "error": str(e)})
             return {"played": False, "error": str(e)}
         finally:
@@ -112,7 +117,8 @@ class StreamingPlayer:
                 await self._queue.put(pcm)
             self._queue.put_nowait(None)
         except Exception:
-            self._queue.put_nowait(None)
+            with contextlib.suppress(asyncio.QueueFull):
+                self._queue.put_nowait(None)
             raise
 
     async def _write_loop(self) -> None:
