@@ -25,6 +25,7 @@ async def handle_status(params: dict, daemon) -> dict:
         "listening": daemon.listening,
         "hotwords": list(daemon.hotwords),
         "wake_armed": daemon.wake_armed,
+        "speaking": daemon.speaking,
     }
 
 
@@ -121,6 +122,21 @@ async def handle_wake(params: dict, daemon) -> dict:
     return await daemon.disarm_wake()
 
 
+async def handle_speak(params: dict, daemon) -> dict:
+    text = params.get("text", "")
+    if not text:
+        raise ValueError("text required")
+    voice = params.get("voice", "") or daemon.config.tts_voice
+    model = params.get("model", "") or _resolve_tts_model(daemon)
+    logger.info("speech.speak chars=%d model=%s", len(text), model)
+    return await daemon.speak(text, voice=voice, model=model)
+
+
+async def handle_stop_tts(params: dict, daemon) -> dict:
+    logger.info("speech.stop_tts")
+    return await daemon.stop_tts()
+
+
 def build_methods(daemon) -> dict:
     return {
         "speech.ping": lambda params: handle_ping(params, daemon),
@@ -132,4 +148,6 @@ def build_methods(daemon) -> dict:
         "speech.stop_listening": lambda params: handle_stop_listening(params, daemon),
         "speech.set_hotwords": lambda params: handle_set_hotwords(params, daemon),
         "speech.wake": lambda params: handle_wake(params, daemon),
+        "speech.speak": lambda params: handle_speak(params, daemon),
+        "speech.stop_tts": lambda params: handle_stop_tts(params, daemon),
     }
