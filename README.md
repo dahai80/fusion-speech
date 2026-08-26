@@ -84,7 +84,7 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_PORT` | `11465` | HTTP port (localhost only) |
 | `FUSION_SOCKET_DIR` | `~/.fusion-speech/run` | UDS socket directory (0o700) |
 | `FUSION_SPEECH_STT_MODEL` | `openai/whisper-tiny` | STT model id (use `openai/whisper-large-v3` for multilingual incl. zh) |
-| `FUSION_SPEECH_TTS_MODEL` | `mlx-community/Kokoro-82M-bf16` | TTS model id |
+| `FUSION_SPEECH_TTS_MODEL` | `kokoro` | TTS model id (fusion-mlx alias) |
 | `FUSION_SPEECH_TTS_VOICE` | `af_heart` | TTS voice |
 | `FUSION_SPEECH_LANGUAGE` | `en` | default STT language (set `zh` with `openai/whisper-large-v3`) |
 | `FUSION_SPEECH_SAMPLE_RATE` | `16000` | capture sample rate |

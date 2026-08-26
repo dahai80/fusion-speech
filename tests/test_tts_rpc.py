@@ -76,10 +76,41 @@ async def test_speak_rpc_round_trip():
 @pytest.mark.asyncio
 async def test_status_reports_speaking():
     daemon = SpeechDaemon(load_config())
-    _patch_daemon_tts(daemon)
+    release = asyncio.Event()
+    seen_mid_flight = []
+
+    async def synth(cfg, text, *, voice="", model="", stream=True, streaming_interval=None):
+        yield _wav_header(16000, 4)
+        yield (np.zeros(4, dtype=np.int16)).tobytes()
+        await release.wait()
+
+    def factory(**kwargs):
+        return _FakeOutStream(**kwargs)
+
+    real_speak = daemon.speak
+
+    async def patched_speak(text, voice="", model="", synthesize=None, stream_factory=None):
+        return await real_speak(
+            text,
+            voice=voice,
+            model=model,
+            synthesize=synthesize or synth,
+            stream_factory=stream_factory or factory,
+        )
+
+    daemon.speak = patched_speak
     dispatcher = JsonRpcDispatcher(build_methods(daemon))
-    s0 = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 1, "method": "speech.status"})
-    assert s0["result"]["speaking"] is False
+    task = asyncio.create_task(
+        dispatcher.dispatch({"jsonrpc": "2.0", "id": 1, "method": "speech.speak", "params": {"text": "hi"}})
+    )
+    await asyncio.sleep(0.05)
+    s_mid = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 2, "method": "speech.status"})
+    seen_mid_flight.append(s_mid["result"]["speaking"])
+    release.set()
+    await asyncio.wait_for(task, timeout=3.0)
+    s_done = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 3, "method": "speech.status"})
+    assert seen_mid_flight == [True], "speaking was not True mid-flight"
+    assert s_done["result"]["speaking"] is False
 
 
 class _FakeWake:

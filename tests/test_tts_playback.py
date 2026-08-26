@@ -102,6 +102,42 @@ async def test_speak_fail_soft_when_output_open_raises():
 
 
 @pytest.mark.asyncio
+async def test_speak_fails_when_write_raises():
+    class _WriteErrorStream:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.started = False
+
+        def start(self):
+            self.started = True
+
+        def stop(self):
+            pass
+
+        def close(self):
+            pass
+
+        def write(self, data):
+            raise OSError("portaudio underrun")
+
+    async def synth(cfg, text, *, voice="", model="", stream=True, streaming_interval=None):
+        yield _wav_header(16000, 4)
+        yield (np.zeros(4, dtype=np.int16)).tobytes()
+
+    cfg = load_config()
+
+    def factory(**kwargs):
+        return _WriteErrorStream(**kwargs)
+
+    player = StreamingPlayer(cfg, synthesize=synth, stream_factory=factory)
+    res = await player.speak("hi")
+    assert res["played"] is False
+    assert "write failed" in res["error"]
+    assert "underrun" in res["error"]
+    assert player.active is False
+
+
+@pytest.mark.asyncio
 async def test_speak_resamples_when_rate_mismatch():
     src_rate = 24000
     pcm = (np.sin(np.linspace(0, 100, 2400)) * 0.3).astype(np.float32)
