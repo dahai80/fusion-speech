@@ -90,6 +90,12 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_SAMPLE_RATE` | `16000` | capture sample rate |
 | `FUSION_SPEECH_VAD_THRESHOLD` | `0.3` | VAD speech threshold |
 | `FUSION_SPEECH_CHUNK_MS` | `300` | streaming chunk size |
+| `FUSION_SPEECH_WAKE_WORD` | `hey_jarvis` | default wake word (pretrained: alexa/hey_mycroft/hey_jarvis/hey_rhasspy/timer/weather) |
+| `FUSION_SPEECH_WAKE_THRESHOLD` | `0.5` | wake score threshold (0-1) |
+| `FUSION_SPEECH_WAKE_AUTO_LISTEN_S` | `8.0` | auto-listen window after a wake |
+| `FUSION_SPEECH_WAKE_DEBOUNCE_S` | `1.0` | cooldown between wake fires |
+| `FUSION_SPEECH_WAKE_MODEL_DIR` | `~/.fusion-speech/models/wakeword` | wake ONNX model cache dir |
+| `FUSION_SPEECH_WAKE_MODEL_URL` | GitHub releases v0.5.1 | wake model download base URL (override for a mirror) |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -105,8 +111,33 @@ JSON-RPC 2.0 over UDS, newline-delimited. Peer UID verified (fail-closed).
 | `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
 | `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
+| `speech.start_listening` | `{}` | `{listening: true}` — arms mic capture + streaming ASR |
+| `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
+| `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` — register wake words (pretrained names only; unknown dropped) |
+| `speech.wake` | `{arm: true\|false}` | `{armed: bool, words: [...]}` — arm/disarm wake detection |
 
-M2-M4 add: `speech.asr`, `speech.tts_chunk` streaming notifications, `speech.set_hotwords`, `speech.wake`.
+M2 realtime push: connect WebSocket `/stream/stt` to receive `speech.asr`
+notification frames (`listening` → `speaking` → `transcribing` → `final`, or
+`error`; `keepalive` every 30s idle). M3 adds `speech.wake` notifications on the
+same socket (then auto-starts ASR for the listen window). M4 adds
+`speech.tts_chunk`.
+
+### Wake (M3)
+
+`speech.wake {arm: true}` arms always-on wake-word detection (openwakeword, ONNX).
+On a wake the daemon emits a `speech.wake` notification to `/stream/stt`
+subscribers, pauses wake, auto-starts streaming ASR for
+`FUSION_SPEECH_WAKE_AUTO_LISTEN_S` seconds (reusing the same mic source), then
+stops ASR and resumes wake — the classic assistant flow. Wake is paused during
+ASR so your own speech does not self-trigger. Fail-soft: if openwakeword or the
+ONNX models are unavailable, `speech.wake` returns `{armed: false}` and the
+daemon keeps running.
+
+Wake models (the wake word `.onnx` + `melspectrogram.onnx` + `embedding_model.onnx`)
+download on first arm to `FUSION_SPEECH_WAKE_MODEL_DIR` from
+`FUSION_SPEECH_WAKE_MODEL_URL` (default: openWakeWord GitHub releases v0.5.1).
+Pretrained words: `alexa`, `hey_mycroft`, `hey_jarvis`, `hey_rhasspy`, `timer`,
+`weather`.
 
 Handler errors map to `-32000` as `"<ExceptionType> [(status N)]: <message>"`
 (e.g. `AudioBridgeError (status 404): synthesize failed: Model ... not found`).
@@ -154,8 +185,35 @@ Milestone progress:
     Note: `mlx-community/whisper-*-mlx*` repos ship NO tokenizer files → unusable
     for `mlx_audio.stt` (empty vocab → `IndexError`); use `openai/whisper-*`.
     Tracked: issue #649 + PR on fusion-mlx, per the upstream-first workflow.
-- **M2** — realtime mic capture + streaming ASR
-- **M3** — hotword wake
+- **M2** — realtime mic capture + streaming ASR. **done**
+  - Ring buffer: lock-free SPSC numpy ring, drop-oldest on overrun (capture never
+    blocks). AudioSource wraps `sounddevice` 16 kHz mono (lazy import, headless-safe).
+  - VAD: two-tier energy RMS gate + Silero ONNX (`silero_vad_16k_op15.onnx`). The
+    64-sample rolling context prepend is required — without it probs collapse to
+    ~0.001 on all audio. Fail-soft to energy-only if the model is missing.
+  - StreamingListener: drain mirrors samples, VAD segments on speech onset /
+    silence-after-speech, segment PCM → 16-bit WAV → `transcribe_stream` →
+    `speech.asr` `final` notification. Sub-0.1s segments skipped.
+  - Realtime push: WebSocket `/stream/stt` with per-subscriber queue fan-out
+    (drop-oldest on full); `speech.start_listening`/`stop_listening` RPC.
+  - Verified: 55 tests green incl. real-load Silero on a speech WAV fixture and
+    an end-to-end start → capture → transcribe → final-to-subscriber integration test.
+- **M3** — hotword wake. **done**
+  - `wake_word.py`: openwakeword ONNX keyword spotting (`hey_jarvis` default).
+    Reuses the M2 mic ring; drain reads 1280-sample (80ms) frames →
+    `openwakeword.Model.predict`. Score ≥ threshold fires `on_wake` once, then a
+    debounce cooldown blocks repeats. `pause()`/`resume()` suspend detection
+    during active ASR (no SPSC read race — paused drain stops reading the ring).
+    Fail-soft: missing openwakeword/models → `enabled=False`, daemon unharmed.
+  - Model cache: wake word + `melspectrogram.onnx` + `embedding_model.onnx`
+    download on first arm to `~/.fusion-speech/models/wakeword/` from the
+    openWakeWord GitHub releases (URL configurable for a mirror).
+  - RPC: `speech.wake {arm}` arms/disarms; `speech.set_hotwords {hotwords}`
+    swaps words at runtime (pretrained names only). Coexistence: on wake →
+    `speech.wake` notification → pause wake → auto `start_listening` for the
+    listen window → `stop_listening` → resume wake.
+  - Verified: 72 tests green incl. a real-load test (downloads hey_jarvis ONNX,
+    feeds 2s silence, asserts no false wake).
 - **M4** — streaming TTS playback
 - **M5** — fusion-studio integration (upstream issue/PR)
 - **M6** — tests, integration, docs
