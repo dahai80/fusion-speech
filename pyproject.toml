@@ -1,0 +1,57 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "fusion-speech"
+version = "0.1.0"
+license = "Apache-2.0"
+description = "Local-first low-latency speech daemon (streaming STT/TTS/wake), delegates inference to fusion-mlx"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx",
+    "fastapi",
+    "uvicorn",
+    "pydantic",
+    "numpy",
+    "sounddevice",
+]
+
+[project.optional-dependencies]
+audio = [
+    "onnxruntime",
+    "openwakeword",
+]
+test = [
+    "pytest",
+    "pytest-asyncio",
+    "pytest-cov",
+    "pytest-mock",
+    "ruff",
+]
+
+[project.scripts]
+fusion-speech = "fusion_speech.server:main"
+
+[tool.setuptools.packages.find]
+include = ["fusion_speech*"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["fusion_speech"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = ["*.md"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
