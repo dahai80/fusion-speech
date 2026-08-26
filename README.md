@@ -102,10 +102,20 @@ JSON-RPC 2.0 over UDS, newline-delimited. Peer UID verified (fail-closed).
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp}` |
 | `speech.status` | `{}` | running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords |
+| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` (STT — see upstream blocker) |
+| `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
+| `speech.list_models` | `{}` | `{total, audio_models}` |
 
-M1+ adds: `speech.transcribe`, `speech.synthesize_stream`, `speech.tts_chunk`,
-`speech.set_hotwords`, `speech.wake`, streaming notifications `speech.asr`,
-`speech.tts_chunk`.
+M2-M4 add: `speech.asr`, `speech.tts_chunk` streaming notifications, `speech.set_hotwords`, `speech.wake`.
+
+Handler errors map to `-32000` as `"<ExceptionType> [(status N)]: <message>"`
+(e.g. `AudioBridgeError (status 404): synthesize failed: Model ... not found`).
+
+Model resolution: when no `model` param is given, the daemon uses the configured
+default (`FUSION_SPEECH_TTS_MODEL` / `FUSION_SPEECH_STT_MODEL`); if that id is not
+in the probed fusion-mlx model set, it falls back to the first probed audio model
+of that modality (logged at WARNING). This makes `speech.synthesize {}` work
+out-of-box even when fusion-mlx's loaded model differs from the configured default.
 
 Error codes follow JSON-RPC 2.0: `-32700` parse error, `-32600` invalid request,
 `-32601` method not found, `-32603` internal error, `-32000` handler error.
@@ -131,7 +141,17 @@ Milestone progress:
 
 - **M0** — engineering skeleton (this release): daemon, UDS JSON-RPC, fusion-mlx
   audio-lane probe, `/health`, `start.sh` lifecycle, unit tests. **done**
-- **M1** — fusion-mlx delegation bridge (transcribe/synthesize via HTTP). next
+- **M1** — fusion-mlx delegation bridge (transcribe/synthesize via HTTP). **done**
+  - TTS verified real-load: `speech.synthesize` over UDS JSON-RPC → fusion-mlx
+    Qwen3-TTS, 388 KB WAV in 5.3 s; out-of-box with probe-driven model fallback.
+  - STT blocked by upstream fusion-mlx discovery bug: mlx-community whisper
+    checkpoints ship `model_type:"whisper"` but no `architectures` field, so
+    `detect_model_type` skips them → `/v1/audio/transcriptions` returns 404 for
+    `whisper`/`whisper-large-v3-mlx`. The bridge code is correct against the API
+    contract and returns a clear `AudioBridgeError (status 404)`; it will work
+    once the upstream model is discoverable. Tracked: file issue → PR on
+    fusion-mlx (fall back to `model_type:"whisper"` → audio_stt when
+    `architectures` absent), per the upstream-first workflow.
 - **M2** — realtime mic capture + streaming ASR
 - **M3** — hotword wake
 - **M4** — streaming TTS playback

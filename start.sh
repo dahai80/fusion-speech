@@ -125,11 +125,6 @@ do_doctor() {
     else
         echo "[warn] sounddevice missing (capture disabled until M2)"
     fi
-    if python3 -c "import mlx_audio" 2>/dev/null; then
-        echo "[ok] mlx_audio importable"
-    else
-        echo "[warn] mlx_audio missing (delegated inference via fusion-mlx HTTP still works)"
-    fi
     if curl -sf "http://127.0.0.1:${DEFAULT_PORT}/health" >/dev/null 2>&1; then
         echo "[ok] /health reachable on $DEFAULT_PORT"
     else

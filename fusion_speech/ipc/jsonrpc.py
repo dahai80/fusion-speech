@@ -57,6 +57,16 @@ def error_response(msg_id: Any, code: int, message: str) -> dict:
     return {"jsonrpc": "2.0", "id": msg_id, "error": {"code": code, "message": message}}
 
 
+def _format_handler_error(e: Exception) -> str:
+    msg = str(e).strip()
+    status = getattr(e, "status", 0)
+    if not msg:
+        return f"{type(e).__name__} (status {status})" if status else type(e).__name__
+    if status:
+        return f"{type(e).__name__} (status {status}): {msg}"
+    return f"{type(e).__name__}: {msg}"
+
+
 class JsonRpcDispatcher:
     def __init__(self, handlers: dict[str, Any]):
         self._handlers = handlers
@@ -87,7 +97,7 @@ class JsonRpcDispatcher:
             return success_response(msg_id, result)
         except Exception as e:
             logger.exception("handler error for %s", method)
-            return error_response(msg_id, -32000, str(e))
+            return error_response(msg_id, -32000, _format_handler_error(e))
 
 
 async def handle_client(
