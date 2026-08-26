@@ -92,13 +92,11 @@ class StreamingPlayer:
                 if not header_seen:
                     if len(chunk) < _WAV_HEADER_LEN:
                         logger.warning("tts first chunk < header (%d)", len(chunk))
-                        header_seen = True
-                        data = chunk
-                    else:
-                        self._sample_rate = _parse_wav_sample_rate(chunk[:_WAV_HEADER_LEN])
-                        logger.info("tts stream rate=%d", self._sample_rate)
-                        header_seen = True
-                        data = chunk[_WAV_HEADER_LEN:]
+                        raise TtsPlaybackError("first chunk shorter than WAV header")
+                    self._sample_rate = _parse_wav_sample_rate(chunk[:_WAV_HEADER_LEN])
+                    logger.info("tts stream rate=%d", self._sample_rate)
+                    header_seen = True
+                    data = chunk[_WAV_HEADER_LEN:]
                 else:
                     data = chunk
                 if leftover:
@@ -168,8 +166,9 @@ class StreamingPlayer:
             return
         try:
             stream.write(np.ascontiguousarray(frame, dtype=np.float32))
-        except Exception:
+        except Exception as e:
             logger.exception("tts write failed")
+            raise TtsPlaybackError(f"write failed: {e}") from e
 
     def _close_stream(self) -> None:
         stream = self._out_stream
