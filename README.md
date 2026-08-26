@@ -96,6 +96,8 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_WAKE_DEBOUNCE_S` | `1.0` | cooldown between wake fires |
 | `FUSION_SPEECH_WAKE_MODEL_DIR` | `~/.fusion-speech/models/wakeword` | wake ONNX model cache dir |
 | `FUSION_SPEECH_WAKE_MODEL_URL` | GitHub releases v0.5.1 | wake model download base URL (override for a mirror) |
+| `FUSION_SPEECH_TTS_BUFFER_S` | `2.0` | TTS playback buffer cap (seconds) |
+| `FUSION_SPEECH_TTS_OUTPUT_DEVICE` | (system default) | sounddevice output device |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -115,12 +117,14 @@ JSON-RPC 2.0 over UDS, newline-delimited. Peer UID verified (fail-closed).
 | `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
 | `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` — register wake words (pretrained names only; unknown dropped) |
 | `speech.wake` | `{arm: true\|false}` | `{armed: bool, words: [...]}` — arm/disarm wake detection |
+| `speech.speak` | `{text, voice?, model?}` | `{played, chars, sample_rate}` — streams TTS to the speaker (pauses mic) |
+| `speech.stop_tts` | `{}` | `{stopped}` — cancel active playback |
 
 M2 realtime push: connect WebSocket `/stream/stt` to receive `speech.asr`
 notification frames (`listening` → `speaking` → `transcribing` → `final`, or
 `error`; `keepalive` every 30s idle). M3 adds `speech.wake` notifications on the
-same socket (then auto-starts ASR for the listen window). M4 adds
-`speech.tts_chunk`.
+same socket (then auto-starts ASR for the listen window). M4 adds speech.tts
+progress events on the same socket.
 
 ### Wake (M3)
 
@@ -214,7 +218,15 @@ Milestone progress:
     listen window → `stop_listening` → resume wake.
   - Verified: 72 tests green incl. a real-load test (downloads hey_jarvis ONNX,
     feeds 2s silence, asserts no false wake).
-- **M4** — streaming TTS playback
+- **M4** — streaming TTS playback. **done**
+  - `tts_playback.py`: `StreamingPlayer` consumes `mlx_bridge.synthesize_stream`,
+    resamples 24k→16k, feeds a bounded queue a writer task drains into a
+    `sounddevice.OutputStream` (started on first chunk = low TTFA). Cancel drops
+    pending + closes the stream. Fail-soft on device error.
+  - Mic guard: while speaking, wake paused; if ASR was listening, stopped then
+    restarted — no self-trigger, no echo. Reuses M2/M3 primitives.
+  - RPC: `speech.speak`, `speech.stop_tts`; `speech.tts` events (starting/speaking/done/cancelled/error) on `/stream/stt`.
+  - Verified: ~80+ tests green incl. real-load (Kokoro via fusion-mlx, fake output, headless).
 - **M5** — fusion-studio integration (upstream issue/PR)
 - **M6** — tests, integration, docs
 
