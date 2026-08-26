@@ -128,7 +128,9 @@ class SpeechDaemon:
         if self._player is not None and self._player.active:
             logger.warning("speak rejected: already speaking")
             return {"played": False, "error": "already speaking"}
-        player = StreamingPlayer(self.config, notifier=self.broadcast, synthesize=synthesize, stream_factory=stream_factory)
+        player = StreamingPlayer(
+            self.config, notifier=self.broadcast, synthesize=synthesize, stream_factory=stream_factory
+        )
         self._player = player
         wake = self._wake
         was_listening = self._listener is not None and self._listener.active

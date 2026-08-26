@@ -82,9 +82,7 @@ class SpeechConfig:
     tts_playback_buffer_s: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_TTS_BUFFER_S", DEFAULT_TTS_BUFFER_S)
     )
-    tts_output_device: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", "")
-    )
+    tts_output_device: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
     log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
         default_factory=lambda: os.path.expanduser(os.environ.get("FUSION_SPEECH_LOG_DIR", "~/.fusion-speech/logs"))

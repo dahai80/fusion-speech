@@ -96,11 +96,13 @@ class StreamingListener:
             self.config.sample_rate,
             self.vad.energy_only,
         )
-        await self._notify({
-            "event": "speech.asr",
-            "state": "listening",
-            "seq": 0,
-        })
+        await self._notify(
+            {
+                "event": "speech.asr",
+                "state": "listening",
+                "seq": 0,
+            }
+        )
         return {"listening": True}
 
     async def stop(self) -> dict:
@@ -160,32 +162,38 @@ class StreamingListener:
         # capture length (which includes a lead-in for STT context).
         if segment.samples < self.config.sample_rate // 10:  # < 0.1s -> skip
             logger.info("segment %d too short (%d speech samples), skip", seq, segment.samples)
-            await self._notify({
-                "event": "speech.asr",
-                "state": "final",
-                "seq": seq,
-                "text": "",
-                "skipped": True,
-            })
+            await self._notify(
+                {
+                    "event": "speech.asr",
+                    "state": "final",
+                    "seq": seq,
+                    "text": "",
+                    "skipped": True,
+                }
+            )
             return
         pcm = self._collect_pcm(segment)
         if pcm.size == 0:
             logger.info("segment %d empty capture, skip", seq)
-            await self._notify({
-                "event": "speech.asr",
-                "state": "final",
-                "seq": seq,
-                "text": "",
-                "skipped": True,
-            })
+            await self._notify(
+                {
+                    "event": "speech.asr",
+                    "state": "final",
+                    "seq": seq,
+                    "text": "",
+                    "skipped": True,
+                }
+            )
             return
         wav_bytes = pcm_to_wav(pcm, self.config.sample_rate)
-        await self._notify({
-            "event": "speech.asr",
-            "state": "transcribing",
-            "seq": seq,
-            "duration": round(pcm.size / self.config.sample_rate, 3),
-        })
+        await self._notify(
+            {
+                "event": "speech.asr",
+                "state": "transcribing",
+                "seq": seq,
+                "duration": round(pcm.size / self.config.sample_rate, 3),
+            }
+        )
         try:
             result = await self._transcribe(
                 self.config,
@@ -195,23 +203,27 @@ class StreamingListener:
             )
         except Exception as e:
             logger.exception("segment %d transcribe failed", seq)
-            await self._notify({
-                "event": "speech.asr",
-                "state": "error",
-                "seq": seq,
-                "error": str(e),
-            })
+            await self._notify(
+                {
+                    "event": "speech.asr",
+                    "state": "error",
+                    "seq": seq,
+                    "error": str(e),
+                }
+            )
             return
         text = (result.get("text") or "").strip()
         logger.info("segment %d final: %r", seq, text[:120])
-        await self._notify({
-            "event": "speech.asr",
-            "state": "final",
-            "seq": seq,
-            "text": text,
-            "language": result.get("language", ""),
-            "duration": result.get("duration"),
-        })
+        await self._notify(
+            {
+                "event": "speech.asr",
+                "state": "final",
+                "seq": seq,
+                "text": text,
+                "language": result.get("language", ""),
+                "duration": result.get("duration"),
+            }
+        )
 
     def _collect_pcm(self, segment: VadSegment) -> np.ndarray:
         # Slice from the drain-mirrored _capture (onset marked by _on_open),
