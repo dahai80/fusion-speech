@@ -122,15 +122,17 @@ class SpeechDaemon:
         self._wake = None
         return result
 
-    async def speak(self, text: str, voice: str = "", model: str = "") -> dict:
+    async def speak(self, text: str, voice: str = "", model: str = "", *, synthesize=None, stream_factory=None) -> dict:
         from fusion_speech.tts_playback import StreamingPlayer
 
         if self._player is not None and self._player.active:
+            logger.warning("speak rejected: already speaking")
             return {"played": False, "error": "already speaking"}
-        player = StreamingPlayer(self.config, notifier=self.broadcast)
+        player = StreamingPlayer(self.config, notifier=self.broadcast, synthesize=synthesize, stream_factory=stream_factory)
         self._player = player
         wake = self._wake
         was_listening = self._listener is not None and self._listener.active
+        logger.info("speak chars=%d voice=%s was_listening=%s", len(text), voice, was_listening)
         if wake is not None and wake.active and not wake.paused:
             wake.pause()
         if was_listening:
@@ -143,14 +145,20 @@ class SpeechDaemon:
             self.speaking = False
             self._player = None
             if wake is not None and wake.active and wake.paused:
-                wake.resume()
+                try:
+                    wake.resume()
+                except Exception as e:
+                    logger.warning("wake resume failed: %s", e)
             if was_listening:
-                with contextlib.suppress(Exception):
+                try:
                     await self.start_listening()
+                except Exception as e:
+                    logger.warning("start_listening resume failed: %s", e)
         return result
 
     async def stop_tts(self) -> dict:
         player = self._player
+        logger.info("speech.stop_tts active=%s", player is not None)
         if player is None:
             return {"stopped": False}
         return await player.cancel()
@@ -283,8 +291,11 @@ class SpeechDaemon:
     async def stop(self) -> None:
         self.running = False
         if self._player is not None:
-            with contextlib.suppress(Exception):
+            logger.info("stopping TTS player on daemon stop")
+            try:
                 await self._player.cancel()
+            except Exception as e:
+                logger.warning("TTS player cancel on stop failed: %s", e)
             self._player = None
             self.speaking = False
         if self._wake is not None:
