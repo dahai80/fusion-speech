@@ -24,6 +24,7 @@ async def handle_status(params: dict, daemon) -> dict:
         "tts_model": daemon.config.tts_model,
         "listening": daemon.listening,
         "hotwords": list(daemon.hotwords),
+        "wake_armed": daemon.wake_armed,
     }
 
 
@@ -91,6 +92,35 @@ async def handle_list_models(params: dict, daemon) -> dict:
     return {"total": len(models), "audio_models": audio}
 
 
+async def handle_start_listening(params: dict, daemon) -> dict:
+    # Start realtime mic capture + streaming ASR. speech.asr notifications are
+    # pushed to /stream/stt WebSocket subscribers. Returns once capture starts.
+    logger.info("speech.start_listening")
+    return await daemon.start_listening()
+
+
+async def handle_stop_listening(params: dict, daemon) -> dict:
+    logger.info("speech.stop_listening")
+    return await daemon.stop_listening()
+
+
+async def handle_set_hotwords(params: dict, daemon) -> dict:
+    words = params.get("hotwords") or []
+    if not isinstance(words, list):
+        raise ValueError("hotwords must be a list")
+    accepted = daemon.set_hotwords(words)
+    logger.info("speech.set_hotwords %s -> %s", words, accepted)
+    return {"hotwords": accepted}
+
+
+async def handle_wake(params: dict, daemon) -> dict:
+    arm = bool(params.get("arm", True))
+    logger.info("speech.wake arm=%s", arm)
+    if arm:
+        return await daemon.arm_wake()
+    return await daemon.disarm_wake()
+
+
 def build_methods(daemon) -> dict:
     return {
         "speech.ping": lambda params: handle_ping(params, daemon),
@@ -98,4 +128,8 @@ def build_methods(daemon) -> dict:
         "speech.transcribe": lambda params: handle_transcribe(params, daemon),
         "speech.synthesize": lambda params: handle_synthesize(params, daemon),
         "speech.list_models": lambda params: handle_list_models(params, daemon),
+        "speech.start_listening": lambda params: handle_start_listening(params, daemon),
+        "speech.stop_listening": lambda params: handle_stop_listening(params, daemon),
+        "speech.set_hotwords": lambda params: handle_set_hotwords(params, daemon),
+        "speech.wake": lambda params: handle_wake(params, daemon),
     }
