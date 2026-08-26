@@ -12,10 +12,10 @@ DEFAULT_PORT = 11465
 DEFAULT_SOCKET_NAME = "fusion-speech.sock"
 DEFAULT_SAMPLE_RATE = 16000
 DEFAULT_CHANNELS = 1
-DEFAULT_STT_MODEL = "mlx-community/whisper-large-v3-mlx"
+DEFAULT_STT_MODEL = "openai/whisper-tiny"
 DEFAULT_TTS_MODEL = "mlx-community/Kokoro-82M-bf16"
 DEFAULT_TTS_VOICE = "af_heart"
-DEFAULT_LANGUAGE = "zh"
+DEFAULT_LANGUAGE = "en"
 VAD_SPEECH_THRESHOLD = 0.3
 CHUNK_MS = 300
 

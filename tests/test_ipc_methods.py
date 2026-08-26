@@ -25,7 +25,7 @@ async def test_status_returns_lane_and_models():
     dispatcher = JsonRpcDispatcher(build_methods(daemon))
     resp = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 2, "method": "speech.status"})
     result = resp["result"]
-    assert result["stt_model"] == "mlx-community/whisper-large-v3-mlx"
+    assert result["stt_model"] == "openai/whisper-tiny"
     assert result["tts_model"] == "mlx-community/Kokoro-82M-bf16"
     assert result["port"] == daemon.port
     assert "mlx_audio_lane" in result

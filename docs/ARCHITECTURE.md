@@ -84,18 +84,21 @@ fusion-mlx exposes an OpenAI-compatible API. fusion-speech consumes exactly two
 audio endpoints and nothing else:
 
 **STT** — `POST /v1/audio/transcriptions`
-- Multipart: `file` = PCM/WAV bytes, `model` = `mlx-community/whisper-large-v3-mlx`,
-  `language` = `zh` (default).
+- Multipart: `file` = PCM/WAV bytes, `model` = `openai/whisper-tiny` (English;
+  `openai/whisper-large-v3` for multilingual incl. zh), `language` = `en`/`zh`.
 - Response: `{text, language, duration, segments?}`.
 - M1 bridge: `transcribe_stream(config, audio_bytes, *, filename, language, model)` —
   multipart POST, returns the parsed dict, raises `AudioBridgeError(status=...)` on
   non-200. M2 makes this chunked (VAD-segmented audio, post when a segment closes).
-- **Upstream blocker (M1):** mlx-community whisper checkpoints ship
-  `model_type:"whisper"` but no `architectures` field, so fusion-mlx
-  `detect_model_type` skips them → 404 for `whisper`/`whisper-large-v3-mlx`. The
-  bridge is correct against the contract; `speech.transcribe` returns a clear
-  `AudioBridgeError (status 404)`. Tracked: file issue → PR on fusion-mlx (fall
-  back to `model_type:"whisper"` → audio_stt when `architectures` absent).
+- **Upstream fix required (M1, issue #649):** fusion-mlx `_is_hf_cache_mlx_compatible`
+  rejected HF-format audio repos — `openai/whisper-tiny` ships HF `model.safetensors`
+  (metadata `format:pt`, not `mlx`) + a full tokenizer, and its repo name carries no
+  `mlx` marker, so it was skipped → 404. `mlx_audio` loads HF-format audio weights
+  natively, so the fix adds an audio-model branch (`detect_model_type` ∈ audio_* with
+  any weights → accept). Verified real-load after fix: `speech.transcribe` over UDS →
+  `openai/whisper-tiny` → "Welcome to First National Bank! How may I assist you today?"
+  in 1.5 s. Note: `mlx-community/whisper-*-mlx*` repos ship NO tokenizer files →
+  unusable (empty vocab → `IndexError` at `non_speech_tokens`); use `openai/whisper-*`.
 
 **TTS** — `POST /v1/audio/speech`
 - JSON: `{model, input, voice, response_format, stream, streaming_interval?}`.
@@ -147,7 +150,7 @@ params are normalized to dict. Handler exceptions map to `-32000` via
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp: <float>}` |
 | `speech.status` | `{}` | `{running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords}` |
-| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` (STT — upstream blocker) |
+| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
 | `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
 
@@ -288,8 +291,9 @@ after merge.
 - **M0** — engineering skeleton: daemon, UDS JSON-RPC (ping/status), fusion-mlx
   audio-lane probe, `/health`, `start.sh`, unit tests, docs. **done**
 - **M1** — fusion-mlx delegation bridge: implement `transcribe_stream` /
-  `synthesize_stream` over HTTP; checkpoint = real-load whisper-large-v3-mlx +
-  Kokoro, transcribe/synthesize playable. (uses key from settings.json; start/stop
+  `synthesize_stream` over HTTP; checkpoint = real-load STT (`openai/whisper-tiny`) +
+  TTS (Qwen3-TTS), transcribe/synthesize playable. **done** (STT needed upstream
+  fusion-mlx discovery fix, issue #649). (uses key from settings.json; start/stop
   fusion-mlx via `~/claude-home/fusion-mlx/start.sh`)
 - **M2** — realtime mic capture + streaming ASR: ring_buffer, audio_source, vad,
   stt_stream, `speech.asr`, WS `/stream/stt`.
