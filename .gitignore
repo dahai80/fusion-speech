@@ -1,0 +1,18 @@
+# build artifacts
+*.egg-info/
+*.egg
+build/
+dist/
+
+# caches
+.pytest_cache/
+.ruff_cache/
+__pycache__/
+*.pyc
+
+# runtime / pid / lock
+.fusion-speech.pid
+.fusion-speech.pid.lock
+
+# logs
+*.log
