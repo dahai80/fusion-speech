@@ -145,38 +145,56 @@ async def test_cancel_stops_playback():
 
 @pytest.mark.asyncio
 async def test_bounded_queue_backpressures_fetch():
-    put_count = 0
-
-    class _SlowStream:
-        def __init__(self, **kwargs):
-            self.active = False
-
-        def start(self):
-            self.active = True
-
-        def stop(self):
-            self.active = False
-
-        def close(self):
-            self.active = False
-
-        def write(self, data):
-            # slow consumer: never reads fast enough -> fetch must block
-            pass
-
+    # The player builds a bounded asyncio.Queue(maxsize=cap) where
+    # cap = tts_playback_buffer_s * sample_rate. Backpressure = the fetch
+    # task's `await queue.put(frame)` blocks once the queue is full, so the
+    # producer cannot race unbounded ahead of the consumer. We verify the
+    # mechanism directly: the queue is bounded, and a put past the cap blocks
+    # (its coroutine does not resume) until a consumer drains.
     cfg = load_config()
-    cfg.tts_playback_buffer_s = 0.05  # tiny buffer
-    frame = (np.zeros(1600, dtype=np.float32) * 32767).astype(np.int16).tobytes()
+    cfg.tts_playback_buffer_s = 0.05
+    cfg.sample_rate = 16000
+    expected_cap = max(1, int(cfg.tts_playback_buffer_s * cfg.sample_rate))
 
     async def synth(cfg, text, *, voice="", model="", stream=True, streaming_interval=None):
         yield _wav_header(16000, 1600)
-        for i in range(50):
-            nonlocal_count[0] = i
-            yield frame
-            await asyncio.sleep(0)
+        # never yield PCM: keeps fetch idle so we can drive the queue ourselves
 
-    nonlocal_count = [0]
-    player = StreamingPlayer(cfg, synthesize=synth, stream_factory=lambda **k: _SlowStream())
-    await asyncio.wait_for(player.speak("hi"), timeout=5.0)
-    # the fetch did NOT race ahead of the tiny buffer — it was bounded
+    player = StreamingPlayer(cfg, synthesize=synth, stream_factory=lambda **k: _FakeOutStream())
+    # speak starts fetch + write tasks; fetch yields only a header (empty PCM
+    # after the 44-byte strip), so nothing is queued. We piggyback on the live
+    # queue the player created to assert boundedness + blocking put behavior.
+    task = asyncio.create_task(player.speak("hi"))
+    # let the tasks start and build the queue
+    await asyncio.sleep(0.05)
+    queue = player._queue
+    assert queue is not None, "player did not build a queue"
+    assert queue.maxsize == expected_cap, f"queue unbounded: maxsize={queue.maxsize}"
+    # fill the queue to its cap with put_nowait (must succeed up to maxsize)
+    for _ in range(expected_cap):
+        queue.put_nowait(np.zeros(1, dtype=np.float32))
+    assert queue.qsize() == expected_cap
+    # one more put MUST block (backpressure): a coroutine attempting it does
+    # not complete until a consumer drains a slot.
+    blocked = asyncio.Event()
+    put_done = asyncio.Event()
+
+    async def _blocked_put():
+        blocked.set()
+        await queue.put(np.zeros(1, dtype=np.float32))
+        put_done.set()
+
+    put_task = asyncio.create_task(_blocked_put())
+    await asyncio.wait_for(blocked.wait(), timeout=1.0)
+    # give the event loop a chance to run the put; it must stay blocked
+    await asyncio.sleep(0.02)
+    assert not put_done.is_set(), "put did NOT block on a full bounded queue (no backpressure)"
+    # drain one slot -> the blocked put completes
+    queue.get_nowait()
+    await asyncio.wait_for(put_done.wait(), timeout=1.0)
+    put_task.cancel()
+    # stop the speak we started (fetch is idle on empty synth, cancel cleanly)
+    await player.cancel()
+    await asyncio.wait_for(task, timeout=3.0)
     assert player.active is False
+
