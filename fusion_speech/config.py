@@ -24,6 +24,7 @@ DEFAULT_WAKE_AUTO_LISTEN_S = 8.0
 DEFAULT_WAKE_DEBOUNCE_S = 1.0
 DEFAULT_WAKE_MODEL_DIR = "~/.fusion-speech/models/wakeword"
 DEFAULT_WAKE_MODEL_URL = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1"
+DEFAULT_TTS_BUFFER_S = 2.0
 
 
 def _env_int(key: str, default: int) -> int:
@@ -77,6 +78,12 @@ class SpeechConfig:
     )
     wake_model_url: str = field(
         default_factory=lambda: os.environ.get("FUSION_SPEECH_WAKE_MODEL_URL", DEFAULT_WAKE_MODEL_URL)
+    )
+    tts_playback_buffer_s: float = field(
+        default_factory=lambda: _env_float("FUSION_SPEECH_TTS_BUFFER_S", DEFAULT_TTS_BUFFER_S)
+    )
+    tts_output_device: str = field(
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", "")
     )
     log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
