@@ -15,9 +15,13 @@ from fusion_speech.server import SpeechDaemon
 def _wav_header(sample_rate: int, num_samples: int) -> bytes:
     data = num_samples * 2
     return (
-        b"RIFF" + struct.pack("<I", 36 + data) + b"WAVE"
-        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
-        + b"data" + struct.pack("<I", data)
+        b"RIFF"
+        + struct.pack("<I", 36 + data)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data"
+        + struct.pack("<I", data)
     )
 
 

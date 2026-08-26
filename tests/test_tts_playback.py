@@ -14,9 +14,13 @@ from fusion_speech.tts_playback import StreamingPlayer
 def _wav_header(sample_rate: int, num_samples: int) -> bytes:
     data = num_samples * 2
     return (
-        b"RIFF" + struct.pack("<I", 36 + data) + b"WAVE"
-        + b"fmt " + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
-        + b"data" + struct.pack("<I", data)
+        b"RIFF"
+        + struct.pack("<I", 36 + data)
+        + b"WAVE"
+        + b"fmt "
+        + struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16)
+        + b"data"
+        + struct.pack("<I", data)
     )
 
 
@@ -121,7 +125,7 @@ async def test_speak_resamples_when_rate_mismatch():
 
 @pytest.mark.asyncio
 async def test_cancel_stops_playback():
-    big = (np.zeros(16000 * 10, dtype=np.float32))
+    big = np.zeros(16000 * 10, dtype=np.float32)
 
     async def synth(cfg, text, *, voice="", model="", stream=True, streaming_interval=None):
         yield _wav_header(16000, big.size)
@@ -250,4 +254,3 @@ async def test_real_tts_loads_and_streams():
     assert res["sample_rate"] > 0
     states = [n.get("state") for n in notified if n.get("event") == "speech.tts"]
     assert "done" in states
-

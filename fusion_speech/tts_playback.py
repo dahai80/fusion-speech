@@ -84,9 +84,7 @@ class StreamingPlayer:
         header_seen = False
         leftover = b""
         try:
-            async for chunk in self._synthesize(
-                self.config, text, voice=voice, model=model, stream=True
-            ):
+            async for chunk in self._synthesize(self.config, text, voice=voice, model=model, stream=True):
                 if self._cancelled:
                     break
                 if not chunk:
