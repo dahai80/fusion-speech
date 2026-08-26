@@ -61,15 +61,15 @@ check `*fusion_speech.server*`), mirroring the canonical `fusion-projects/start.
 └─────────────────────────────────────────────────────────┘
 ```
 
-Modules (current M0 state marked):
+Modules (M1 state marked):
 
 | Module | Layer | Milestone | Status |
 |---|---|---|---|
 | `config.py` | config | M0 | done |
 | `logging.py` | logging (re-export fusion_core) | M0 | done |
-| `ipc/jsonrpc.py` | UDS transport + JSON-RPC dispatch | M0 | done |
-| `ipc/methods.py` | RPC method handlers | M0 | done (ping/status) |
-| `mlx_bridge.py` | fusion-mlx HTTP delegation | M0 | probe done; STT/TTS at M1 |
+| `ipc/jsonrpc.py` | UDS transport + JSON-RPC dispatch | M0/M1 | done (+ typed error formatting) |
+| `ipc/methods.py` | RPC method handlers | M0/M1 | done (ping/status/transcribe/synthesize/list_models) |
+| `mlx_bridge.py` | fusion-mlx HTTP delegation | M1 | done (probe/transcribe_stream/synthesize_stream/synthesize_full) |
 | `server.py` | daemon lifecycle + FastAPI | M0 | done |
 | `ring_buffer.py` | lock-free SPSC audio ring | M2 | todo |
 | `audio_source.py` | sounddevice capture | M2 | todo |
@@ -86,15 +86,27 @@ audio endpoints and nothing else:
 **STT** — `POST /v1/audio/transcriptions`
 - Multipart: `file` = PCM/WAV bytes, `model` = `mlx-community/whisper-large-v3-mlx`,
   `language` = `zh` (default).
-- Response: `{text: "..."}`.
-- M1 bridge: `transcribe_stream(config, pcm_bytes, *, language, model)` — accumulates
-  VAD-segmented audio, posts when a speech segment closes. M2 makes this chunked.
+- Response: `{text, language, duration, segments?}`.
+- M1 bridge: `transcribe_stream(config, audio_bytes, *, filename, language, model)` —
+  multipart POST, returns the parsed dict, raises `AudioBridgeError(status=...)` on
+  non-200. M2 makes this chunked (VAD-segmented audio, post when a segment closes).
+- **Upstream blocker (M1):** mlx-community whisper checkpoints ship
+  `model_type:"whisper"` but no `architectures` field, so fusion-mlx
+  `detect_model_type` skips them → 404 for `whisper`/`whisper-large-v3-mlx`. The
+  bridge is correct against the contract; `speech.transcribe` returns a clear
+  `AudioBridgeError (status 404)`. Tracked: file issue → PR on fusion-mlx (fall
+  back to `model_type:"whisper"` → audio_stt when `architectures` absent).
 
 **TTS** — `POST /v1/audio/speech`
-- JSON: `{model, input, voice, response_format, stream}`. `stream=true` returns a
-  chunked WAV/PCM body.
-- M1 bridge: `synthesize_stream(config, text, *, voice, model)` — async generator
-  yielding PCM chunks as they arrive. M4 wires these straight to the speaker.
+- JSON: `{model, input, voice, response_format, stream, streaming_interval?}`.
+  `response_format=wav`; non-stream = whole WAV, stream = 44-byte WAV header
+  (data-size `0xFFFFFFFF`) + chunked int16 PCM.
+- M1 bridge: `synthesize_stream(config, text, *, voice, model, stream, streaming_interval)`
+  — async generator yielding WAV header then PCM chunks; parses sample_rate from the
+  header. `synthesize_full` collects all chunks into one `bytes`. M4 wires the
+  generator straight to the speaker.
+- **Verified real-load (M1):** `speech.synthesize` over UDS JSON-RPC → fusion-mlx
+  Qwen3-TTS, 388 KB 16-bit mono 24 kHz WAV in 5.3 s.
 
 **Why not load models here?** fusion-mlx already manages the MLX weight cache,
 warm models, and a shared HTTP surface for every other fusion-* app. Duplicating
@@ -123,27 +135,36 @@ On mismatch (different UID) or `getsockopt` failure, the connection is dropped
 
 **Dispatch.** `JsonRpcDispatcher.dispatch` validates `jsonrpc == "2.0"` (else
 `-32600`), rejects empty/missing method (`-32601`), routes to handler. String
-params are normalized to dict. Handler exceptions map to `-32000`; parse errors
-to `-32700`; unexpected internal errors to `-32603`.
+params are normalized to dict. Handler exceptions map to `-32000` via
+`_format_handler_error` as `"<ExceptionType> [(status N)]: <message>"` (so an
+`httpx.ReadTimeout` with empty `str()` still surfaces a clear
+`ReadTimeout`, and `AudioBridgeError` carries its HTTP status); parse errors to
+`-32700`; unexpected internal errors to `-32603`.
 
-**Methods (M0).**
+**Methods (M0/M1, implemented).**
 
 | Method | Params | Result |
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp: <float>}` |
 | `speech.status` | `{}` | `{running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords}` |
+| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` (STT — upstream blocker) |
+| `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
+| `speech.list_models` | `{}` | `{total, audio_models}` |
 
-**Notifications (M1+).** The daemon pushes async events to connected clients:
+Model resolution: when `model` is omitted, the daemon uses the configured default
+(`FUSION_SPEECH_STT_MODEL` / `FUSION_SPEECH_TTS_MODEL`); if that id is not in the
+probed fusion-mlx set, it falls back to the first probed audio model of that
+modality (WARNING-logged). This makes `speech.synthesize {}` work out-of-box even
+when fusion-mlx's loaded model differs from the configured default.
+
+**Notifications (M2+).** The daemon pushes async events to connected clients:
 `speech.asr` (partial/final transcript), `speech.wake` (wake fired), `speech.tts_chunk`
 (playback progress). Notifications carry no `id`; clients must not reply.
 
-**Methods (M1-M4, planned).**
+**Methods (M2-M4, planned).**
 
 | Method | Purpose |
 |---|---|
-| `speech.transcribe` | one-shot STT from provided audio |
-| `speech.synthesize_stream` | start a TTS stream, return a stream id |
-| `speech.tts_chunk` | pull next PCM chunk for a stream |
 | `speech.set_hotwords` | register hotword phrases |
 | `speech.wake` | arm/disarm wake detection |
 | `speech.start_listening` / `speech.stop_listening` | control mic capture (M2) |

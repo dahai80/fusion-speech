@@ -60,3 +60,54 @@ async def test_str_params_normalized(tmp_socket_dir):
         }
     )
     assert resp["result"]["pong"] is True
+
+
+@pytest.mark.asyncio
+async def test_handler_error_has_type_name_not_empty():
+    class EmptyTimeout(Exception):
+        pass
+
+    handlers = {"speech.boom": lambda params: _raise(EmptyTimeout())}
+    dispatcher = JsonRpcDispatcher(handlers)
+    resp = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 6, "method": "speech.boom"})
+    assert resp["error"]["code"] == -32000
+    assert resp["error"]["message"] == "EmptyTimeout"
+
+
+async def _raise(exc):
+    raise exc
+
+
+@pytest.mark.asyncio
+async def test_handler_error_includes_status_for_audio_bridge_error():
+    from fusion_speech.mlx_bridge import AudioBridgeError
+
+    handlers = {"speech.boom": lambda params: _raise(AudioBridgeError("no model", status=404))}
+    dispatcher = JsonRpcDispatcher(handlers)
+    resp = await dispatcher.dispatch({"jsonrpc": "2.0", "id": 7, "method": "speech.boom"})
+    assert resp["error"]["code"] == -32000
+    assert resp["error"]["message"] == "AudioBridgeError (status 404): no model"
+
+
+def test_resolve_tts_model_falls_back_when_configured_missing():
+    from fusion_speech.ipc.methods import _resolve_tts_model
+
+    daemon = SpeechDaemon(load_config())
+    daemon.audio_lane = {"tts": True, "tts_models": ["Qwen3-TTS-12Hz-1.7B-Base-8bit"]}
+    assert _resolve_tts_model(daemon) == "Qwen3-TTS-12Hz-1.7B-Base-8bit"
+
+
+def test_resolve_tts_model_keeps_configured_when_present():
+    from fusion_speech.ipc.methods import _resolve_tts_model
+
+    daemon = SpeechDaemon(load_config())
+    daemon.audio_lane = {"tts": True, "tts_models": [daemon.config.tts_model, "other"]}
+    assert _resolve_tts_model(daemon) == daemon.config.tts_model
+
+
+def test_resolve_stt_model_keeps_configured_when_no_probed_set():
+    from fusion_speech.ipc.methods import _resolve_stt_model
+
+    daemon = SpeechDaemon(load_config())
+    daemon.audio_lane = {"stt": False, "stt_models": []}
+    assert _resolve_stt_model(daemon) == daemon.config.stt_model
