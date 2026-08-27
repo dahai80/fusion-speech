@@ -28,10 +28,172 @@ class SpeechDaemon:
         self.audio_lane: dict = {"tts": False, "stt": False, "probed": False, "error": ""}
         self.listening = False
         self.hotwords: list[str] = []
+        self.wake_armed = False
+        self._wake = None  # WakeWordEngine, lazily built
+        self.speaking = False
+        self._player = None  # StreamingPlayer, lazily built
         self._server: asyncio.Server | None = None
         self._app: FastAPI | None = None
         self._http_task: asyncio.Task | None = None
         self._dispatcher = JsonRpcDispatcher(build_methods(self))
+        self._listener = None  # StreamingListener, lazily built
+        self._subscribers: set[asyncio.Queue] = set()
+
+    def subscribe(self) -> asyncio.Queue:
+        q: asyncio.Queue = asyncio.Queue()
+        self._subscribers.add(q)
+        logger.info("asr subscriber added (total=%d)", len(self._subscribers))
+        return q
+
+    def unsubscribe(self, q: asyncio.Queue) -> None:
+        self._subscribers.discard(q)
+        logger.info("asr subscriber removed (total=%d)", len(self._subscribers))
+
+    async def broadcast(self, payload: dict) -> None:
+        # fan-out speech.asr notifications to all WS subscribers. A full queue
+        # (slow client) drops the oldest frame rather than blocking the capture
+        # pipeline.
+        for q in list(self._subscribers):
+            try:
+                q.put_nowait(payload)
+            except asyncio.QueueFull:
+                try:
+                    q.get_nowait()
+                    q.put_nowait(payload)
+                except asyncio.QueueEmpty:
+                    pass
+
+    async def start_listening(self, audio_source=None) -> dict:
+        from fusion_speech.mlx_bridge import transcribe_stream
+        from fusion_speech.stt_stream import StreamingListener
+
+        if self._listener is not None and self._listener.active:
+            return {"listening": True, "already": True}
+        self._listener = StreamingListener(
+            self.config,
+            transcribe=transcribe_stream,
+            notifier=self.broadcast,
+            audio_source=audio_source,
+        )
+        try:
+            result = await self._listener.start()
+        except Exception as e:
+            self._listener = None
+            self.listening = False
+            logger.error("start_listening failed: %s", e)
+            raise
+        self.listening = True
+        return result
+
+    async def stop_listening(self) -> dict:
+        listener = self._listener
+        self.listening = False
+        if listener is None:
+            return {"listening": False}
+        result = await listener.stop()
+        self._listener = None
+        return result
+
+    async def arm_wake(self) -> dict:
+        from fusion_speech.wake_word import WakeWordEngine
+
+        if self._wake is not None and self._wake.active:
+            return {"armed": True, "already": True}
+        # share the mic stream with an active listener if one exists, else wake
+        # builds + owns its own AudioSource.
+        source = self._listener.source if (self._listener and self._listener.active) else None
+        self._wake = WakeWordEngine(self.config, on_wake=self._on_wake, audio_source=source)
+        if not self._wake.enabled:
+            logger.warning("wake engine disabled, cannot arm")
+            self.wake_armed = False
+            return {"armed": False, "enabled": False}
+        result = await self._wake.start()
+        self.wake_armed = bool(result.get("armed"))
+        if self.wake_armed:
+            self.hotwords = list(self._wake.words)
+        return result
+
+    async def disarm_wake(self) -> dict:
+        wake = self._wake
+        self.wake_armed = False
+        if wake is None:
+            return {"armed": False}
+        result = await wake.stop()
+        self._wake = None
+        return result
+
+    async def speak(self, text: str, voice: str = "", model: str = "", *, synthesize=None, stream_factory=None) -> dict:
+        from fusion_speech.tts_playback import StreamingPlayer
+
+        if self._player is not None and self._player.active:
+            logger.warning("speak rejected: already speaking")
+            return {"played": False, "error": "already speaking"}
+        player = StreamingPlayer(
+            self.config, notifier=self.broadcast, synthesize=synthesize, stream_factory=stream_factory
+        )
+        self._player = player
+        wake = self._wake
+        was_listening = self._listener is not None and self._listener.active
+        logger.info("speak chars=%d voice=%s was_listening=%s", len(text), voice, was_listening)
+        if wake is not None and wake.active and not wake.paused:
+            wake.pause()
+        if was_listening:
+            with contextlib.suppress(Exception):
+                await self.stop_listening()
+        try:
+            self.speaking = True
+            result = await player.speak(text, voice=voice, model=model)
+        finally:
+            self.speaking = False
+            self._player = None
+            if wake is not None and wake.active and wake.paused:
+                try:
+                    wake.resume()
+                except Exception as e:
+                    logger.warning("wake resume failed: %s", e)
+            if was_listening:
+                try:
+                    await self.start_listening()
+                except Exception as e:
+                    logger.warning("start_listening resume failed: %s", e)
+        return result
+
+    async def stop_tts(self) -> dict:
+        player = self._player
+        logger.info("speech.stop_tts active=%s", player is not None)
+        if player is None:
+            return {"stopped": False}
+        return await player.cancel()
+
+    def set_hotwords(self, words: list[str]) -> list[str]:
+        if self._wake is None:
+            self.hotwords = list(words)
+            return list(words)
+        accepted = self._wake.set_hotwords(words)
+        self.hotwords = list(accepted)
+        return accepted
+
+    async def _on_wake(self, word: str) -> None:
+        # auto-listen handshake: announce the wake, pause detection (so the
+        # user's following speech does not self-trigger), arm ASR for a fixed
+        # window reusing wake's mic source, then stop ASR and resume wake.
+        wake = self._wake
+        if wake is None:
+            return
+        await self.broadcast({"event": "speech.wake", "word": word, "ts": time.time()})
+        if self._listener is not None and self._listener.active:
+            logger.info("wake fired but ASR already active, skip handshake")
+            return
+        wake.pause()
+        try:
+            source = wake.source if wake.own_source else None
+            await self.start_listening(audio_source=source)
+            await asyncio.sleep(self.config.wake_auto_listen_s)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            await self.stop_listening()
+            wake.resume()
 
     async def probe_audio_lane(self) -> dict:
         try:
@@ -51,6 +213,7 @@ class SpeechDaemon:
         return self.audio_lane
 
     def build_app(self) -> FastAPI:
+        from fastapi import WebSocket, WebSocketDisconnect
         from fusion_core.http.app import create_app
 
         app = create_app("fusion-speech", version=__version__, enable_health=False)
@@ -66,6 +229,32 @@ class SpeechDaemon:
                 "tts_model": self.config.tts_model,
                 "listening": self.listening,
             }
+
+        @app.websocket("/stream/stt")
+        async def _stream_stt(ws: WebSocket):
+            # Realtime ASR push channel. Client subscribes; server fans out
+            # speech.asr frames (listening/speaking/transcribing/final/error)
+            # from the active StreamingListener. Start/stop of capture is done
+            # via RPC (speech.start_listening / stop_listening); the WS only
+            # receives notifications.
+            await ws.accept()
+            q = self.subscribe()
+            try:
+                while True:
+                    try:
+                        payload = await asyncio.wait_for(q.get(), timeout=30.0)
+                    except TimeoutError:
+                        await ws.send_json({"event": "speech.asr", "state": "keepalive"})
+                        continue
+                    await ws.send_json(payload)
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                logger.exception("stream/stt websocket error")
+            finally:
+                self.unsubscribe(q)
+                with contextlib.suppress(Exception):
+                    await ws.close()
 
         self._app = app
         return app
@@ -103,6 +292,24 @@ class SpeechDaemon:
 
     async def stop(self) -> None:
         self.running = False
+        if self._player is not None:
+            logger.info("stopping TTS player on daemon stop")
+            try:
+                await self._player.cancel()
+            except Exception as e:
+                logger.warning("TTS player cancel on stop failed: %s", e)
+            self._player = None
+            self.speaking = False
+        if self._wake is not None:
+            with contextlib.suppress(Exception):
+                await self._wake.stop()
+            self._wake = None
+            self.wake_armed = False
+        if self._listener is not None:
+            with contextlib.suppress(Exception):
+                await self._listener.stop()
+            self._listener = None
+            self.listening = False
         if self._server:
             self._server.close()
             await self._server.wait_closed()

@@ -19,9 +19,9 @@ local filesystem. Peer-UID verified so only same-user processes may call the dae
 
 One long-running asyncio daemon: `python3 -m fusion_speech.server`.
 
-- **HTTP server** (uvicorn) on `127.0.0.1:11465` — `/health` only (M0). Used by
-  `start.sh doctor` and external liveness checks. Will host streaming WebSocket
-  endpoints in M2/M4 for non-UDS clients.
+- **HTTP server** (uvicorn) on `127.0.0.1:11465` — `/health` (M0) plus the
+  `/stream/stt` WebSocket (M2, reused by M4) for non-UDS realtime clients. Used
+  by `start.sh doctor` and external liveness checks.
 - **UDS server** (`asyncio.start_unix_server`) at `~/.fusion-speech/run/fusion-speech.sock`
   (mode 0o600, dir 0o700) — newline-delimited JSON-RPC 2.0. Primary control plane.
 - **Startup probe** — `probe_mlx_audio_lane` hits fusion-mlx `/v1/models`, checks
@@ -70,13 +70,13 @@ Modules (M1 state marked):
 | `ipc/jsonrpc.py` | UDS transport + JSON-RPC dispatch | M0/M1 | done (+ typed error formatting) |
 | `ipc/methods.py` | RPC method handlers | M0/M1 | done (ping/status/transcribe/synthesize/list_models) |
 | `mlx_bridge.py` | fusion-mlx HTTP delegation | M1 | done (probe/transcribe_stream/synthesize_stream/synthesize_full) |
-| `server.py` | daemon lifecycle + FastAPI | M0 | done |
-| `ring_buffer.py` | lock-free SPSC audio ring | M2 | todo |
-| `audio_source.py` | sounddevice capture | M2 | todo |
-| `vad.py` | voice activity detection | M2 | todo |
-| `stt_stream.py` | chunked streaming ASR | M2 | todo |
-| `wake_word.py` | hotword wake | M3 | todo |
-| `tts_playback.py` | streaming TTS playback | M4 | todo |
+| `server.py` | daemon lifecycle + FastAPI | M0/M2 | done (+ /stream/stt WS + subscriber fan-out) |
+| `ring_buffer.py` | lock-free SPSC audio ring | M2 | done |
+| `audio_source.py` | sounddevice capture | M2 | done |
+| `vad.py` | voice activity detection | M2 | done (energy gate + Silero ONNX) |
+| `stt_stream.py` | chunked streaming ASR | M2 | done |
+| `wake_word.py` | hotword wake | M3 | done (openwakeword ONNX) |
+| `tts_playback.py` | streaming TTS playback | M4 | done |
 
 ## 4. Inference Delegation (fusion-mlx boundary)
 
@@ -144,7 +144,7 @@ params are normalized to dict. Handler exceptions map to `-32000` via
 `ReadTimeout`, and `AudioBridgeError` carries its HTTP status); parse errors to
 `-32700`; unexpected internal errors to `-32603`.
 
-**Methods (M0/M1, implemented).**
+**Methods (M0/M1/M2, implemented).**
 
 | Method | Params | Result |
 |---|---|---|
@@ -153,6 +153,10 @@ params are normalized to dict. Handler exceptions map to `-32000` via
 | `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
 | `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
+| `speech.start_listening` | `{}` | `{listening: true}` — arms mic capture + streaming ASR |
+| `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
+| `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` — register wake words (pretrained only) |
+| `speech.wake` | `{arm: bool}` | `{armed: bool, words: [...]}` — arm/disarm wake |
 
 Model resolution: when `model` is omitted, the daemon uses the configured default
 (`FUSION_SPEECH_STT_MODEL` / `FUSION_SPEECH_TTS_MODEL`); if that id is not in the
@@ -160,17 +164,22 @@ probed fusion-mlx set, it falls back to the first probed audio model of that
 modality (WARNING-logged). This makes `speech.synthesize {}` work out-of-box even
 when fusion-mlx's loaded model differs from the configured default.
 
-**Notifications (M2+).** The daemon pushes async events to connected clients:
-`speech.asr` (partial/final transcript), `speech.wake` (wake fired), `speech.tts_chunk`
-(playback progress). Notifications carry no `id`; clients must not reply.
+**Notifications (M2/M3, implemented).** The daemon pushes `speech.asr` and
+`speech.wake` events to connected WebSocket subscribers on `/stream/stt` (not
+over UDS — WS is the realtime push channel; UDS stays request/response).
+Notification frames carry no `id`; clients must not reply. `speech.asr` states:
+`listening` (capture armed), `speaking` (VAD onset), `transcribing` (segment
+posted to fusion-mlx), `final` (transcript + `text`/`language`/`duration`, or
+`skipped:true` for sub-0.1s segments), `error`. `speech.wake` carries `{word,
+ts}` and is immediately followed by the auto-started `speech.asr` frames. A
+`keepalive` frame is sent after 30s idle so proxies do not close the socket.
 
-**Methods (M2-M4, planned).**
+**Methods (M4, implemented).**
 
 | Method | Purpose |
 |---|---|
-| `speech.set_hotwords` | register hotword phrases |
-| `speech.wake` | arm/disarm wake detection |
-| `speech.start_listening` / `speech.stop_listening` | control mic capture (M2) |
+| `speech.speak` | `{text, voice?, model?}` → stream TTS to speaker, mic paused |
+| `speech.stop_tts` | `{}` → cancel playback |
 
 ## 6. Realtime Audio Pipeline (M2-M4)
 
@@ -182,38 +191,87 @@ sounddevice (16kHz mono) ─▶ ring_buffer ─▶ VAD ─▶ stt_stream ─▶ 
 ```
 
 - **ring_buffer.py** — lock-free single-producer single-consumer ring (numpy
-  backing). Producer = sounddevice callback (realtime thread, must not block);
-  consumer = asyncio task draining into VAD. SPSC avoids locks on the hot path.
-- **audio_source.py** — `sounddevice.Stream` wrapper, 16 kHz mono, chunk callback
-  into the ring. Lifecycle: `start()`/`stop()`; the daemon toggles via
-  `speech.start_listening`/`speech.stop_listening`.
-- **vad.py** — two-tier: fast energy gate (RMS threshold) filters silence, then
-  `silero-vad` (ONNX) for robust speech/non-speech. Emits segment-open and
-  segment-close events. Silence-after-speech closes a segment and triggers STT.
-- **stt_stream.py** — on segment close, hands the segment's PCM to
-  `mlx_bridge.transcribe_stream`. Partial results (if the STT model supports
-  streaming chunks) are pushed as `speech.asr` notifications with `partial=true`;
-  final results with `final=true`.
+  backing, absolute unwrapped `_total_in`/`_total_out` counters so full/empty
+  stay unambiguous). Producer = sounddevice callback (realtime thread, must not
+  block); consumer = asyncio drain task feeding VAD. SPSC avoids locks on the hot
+  path. `write()` drops oldest on overflow (`_overruns`, `_total_dropped`).
+- **audio_source.py** — `sounddevice.InputStream` wrapper, 16 kHz mono, callback
+  downmixes to mono and writes the ring. Lazy `import sounddevice` (headless-safe);
+  tests inject `stream_factory`. Lifecycle: `start()`/`stop()`.
+- **vad.py** — two-tier. Tier 1: energy RMS gate (skip ONNX when RMS below
+  `0.01`). Tier 2: `silero_vad_16k_op15.onnx` via onnxruntime (CPUExecutionProvider).
+  The ONNX model needs a rolling 64-sample context prepended to each 512-sample
+  window (input length 576); the wrapper saves the last 64 as next context —
+  without this, probabilities collapse to ~0.001 on all audio. State machine:
+  onset (`prob >= threshold`), max-speech cut, silence close
+  (`prob < neg_threshold` for `min_silence_samples`). Emits `on_open` (speech
+  onset) and `on_close` (segment-ready) callbacks. Fail-soft to energy-only if
+  the model file is missing.
+- **stt_stream.py** — the consumer glue. Drain task reads the ring AND mirrors
+  every sample into a `_capture` list (the ring is already drained, so a closed
+  segment's PCM is sliced from `_capture`, not re-read). `on_open` marks the slice
+  start with a 0.2s lead-in; `on_close` schedules `_transcribe_segment` (async).
+  Skip gate: segments with `segment.samples < sample_rate//10` (sub-0.1s of pure
+  speech) emit a `final` with `skipped:true` without calling transcribe. Real
+  segments are PCM→16-bit WAV → `mlx_bridge.transcribe_stream` → `final`
+  notification with text/language/duration. `on_open` fires a `speaking`
+  notification via `run_coroutine_threadsafe` (the VAD runs on the drain task).
+
+**Push channel.** `speech.asr` frames go to WebSocket `/stream/stt` subscribers
+(FastAPI), not over UDS. `SpeechDaemon.subscribe()` returns a per-client
+`asyncio.Queue`; `broadcast()` fans out with drop-oldest on `QueueFull` (a slow
+client must never stall the capture pipeline). The WS handler reads its queue
+with a 30s timeout, sending `keepalive` on idle.
 
 **Backpressure.** The ring buffer drops oldest on overflow (realtime capture
-must never block). The VAD consumer signals overrun via a counter surfaced in
-`speech.status`.
+must never block); overrun counters are tracked on the ring. The subscriber
+fan-out is also drop-oldest so a stalled WS client does not backpressure the
+notifier.
 
 ## 7. Hotword Wake (M3)
 
 Goal: low-CPU always-on listening for wake phrases, then hand off to streaming ASR.
 
-- **wake_word.py** — ONNX keyword-spotting model via `onnxruntime` + `openwakeword`.
-  Runs on the same mic ring buffer but on a downsampled/lighter path to save power.
-- **Two-level filter** — short energy pre-filter (skip obvious silence), then the
-  KWS model. Reduces ONNX invocations.
-- **API** — `speech.set_hotwords` registers phrases; `speech.wake` arms/disarms.
-  On a wake, the daemon emits a `speech.wake` notification and (if configured)
-  auto-starts the streaming ASR pipeline for a fixed listen window.
+```
+sounddevice (16kHz mono) ─▶ ring_buffer ─▶ wake_word (80ms frames) ─▶ openwakeword.predict ─▶ on_wake
+       (shared mic)         (SPSC, shared)  (drain task)              (ONNX, score 0-1)        (handshake)
+```
 
-**Open decision (pre-M3):** engine choice (openwakeword vs a custom KWS), model
-cache path, and the realtime-channel priority between wake and active ASR. These
-are confirmed against fusion-mlx's audio lane before M3 lands.
+- **wake_word.py** — two classes, mirroring the M2 `vad.py` shape.
+  - `WakeModelDownloader.ensure_models(words, cache_dir, base_url)` — fetches the
+    wake word's `.onnx` + the shared `melspectrogram.onnx` + `embedding_model.onnx`
+    into `cache_dir` via httpx, idempotent. `base_url` configurable (default
+    openWakeWord GitHub releases v0.5.1) so a mirror can override it. openwakeword's
+    own `download_models()` has no URL-override hook, so we roll our own.
+  - `WakeWordEngine(config, *, on_wake, audio_source=None)` — the streaming
+    detector. Reuses `audio_source.ring` if passed (shared mic with an active
+    listener), else builds its own RingBuffer + AudioSource. Drain task reads
+    1280-sample (80ms @ 16k) frames — openwakeword's native chunk size — and calls
+    `openwakeword.Model.predict`. `Model` is built with `inference_framework="onnx"`
+    and `melspec_model_path`/`embedding_model_path` pointed at the cache dir, so all
+    three ONNX files load from our cache (no reliance on package resources, which
+    ship empty). A score ≥ `wake_threshold` (default 0.5) fires `on_wake(word)`
+    ONCE, then a `wake_debounce_s` cooldown blocks repeats (one utterance = one
+    wake). `on_wake` may be a coroutine (the daemon's `_on_wake` is); the engine
+    schedules it via `asyncio.ensure_future` and tracks the task for clean stop.
+- **Fail-soft** — if openwakeword is unimportable, the model download fails, or
+  `Model` construction raises, `enabled=False` and the engine is a no-op.
+  `arm_wake()` returns `{armed: false}`; the daemon keeps running. Never fatal.
+- **Coexistence (chosen model)** — wake paused during ASR + auto-listen on wake.
+  On `_on_wake`: broadcast `speech.wake` → `wake.pause()` → `start_listening()`
+  (reusing wake's mic source if wake owns it) → sleep `wake_auto_listen_s`
+  (default 8s) → `stop_listening()` → `wake.resume()`. The pause is critical:
+  while paused the drain does NOT read the ring, so the ASR listener is the sole
+  SPSC consumer (no read race). If ASR is already active when wake fires, the
+  handshake is skipped (already listening).
+- **set_hotwords** — `WakeWordEngine.set_hotwords(words)` swaps the active wake
+  words at runtime. Only pretrained names (`alexa`, `hey_mycroft`, `hey_jarvis`,
+  `hey_rhasspy`, `timer`, `weather`) are usable; unknown names are logged + dropped.
+  Rebuilds the openwakeword `Model` with the new word set.
+- **API** — `speech.wake {arm}` arms/disarms; `speech.set_hotwords {hotwords}`
+  registers words. `speech.wake` notifications flow on the same `/stream/stt` WS
+  as `speech.asr` (no new endpoint); clients see `speech.wake` then the auto-started
+  `speech.asr` frames on one socket.
 
 ## 8. Streaming TTS Playback (M4)
 
@@ -221,22 +279,33 @@ Goal: speak text with minimal time-to-first-audio, playing PCM chunks as they
 arrive rather than waiting for the full synthesis.
 
 ```
-speech.synthesize_stream ─▶ mlx_bridge.synthesize_stream ─▶ tts_playback ─▶ sounddevice (output)
-      (RPC)                  (POST /v1/audio/speech stream)  (边收边播)        (speaker)
+speech.speak ─▶ mlx_bridge.synthesize_stream ─▶ StreamingPlayer ─▶ sounddevice.OutputStream (speaker)
+   (RPC)        (POST /v1/audio/speech stream)  (fetch→resample→queue→writer)  (started on first chunk)
 ```
 
-- **mlx_bridge.synthesize_stream** — async generator yielding PCM chunks from the
-  chunked HTTP response as they arrive.
-- **tts_playback.py** — owns a `sounddevice.OutputStream`. Feeds chunks to a
-  playback buffer; starts the output stream on the first chunk (time-to-first-audio).
-  Resamples if the TTS sample rate differs from the capture rate.
-- **API** — `speech.synthesize_stream` starts a stream, returns a stream id;
-  `speech.tts_chunk` pulls progress; the daemon can also push `speech.tts_chunk`
-  notifications. WS `/stream/tts` offers the same flow for non-UDS clients.
+The daemon owns the `StreamingPlayer`, which in turn owns the
+`sounddevice.OutputStream`. `tts_playback.StreamingPlayer`
+runs the pipeline: fetch PCM chunks from `mlx_bridge.synthesize_stream` →
+resample 24k→16k → push into a bounded queue → a writer task drains the queue
+into the `OutputStream`. The stream is started on the first chunk, so
+time-to-first-audio is bound by the first PCM chunk, not the full synthesis.
 
-**Cancellation.** `speech.tts_cancel` (planned) stops playback and drops pending
-chunks. Playback buffer bounded; if the consumer stalls, synthesis backpressures
-through httpx's streaming read.
+- **mlx_bridge.synthesize_stream** — async generator yielding the WAV header then
+  PCM chunks from the chunked HTTP response as they arrive.
+- **tts_playback.py** — `StreamingPlayer` owns the playback lifecycle. Bounded
+  queue (`FUSION_SPEECH_TTS_BUFFER_S` seconds) backpressures synthesis through
+  httpx's streaming read if the consumer stalls. Cancel drops pending chunks and
+  closes the stream. Fail-soft on device error: if `OutputStream` construction or
+  write fails, playback reports the error and the daemon stays up.
+- **Mic guard.** While speaking, wake is paused; if ASR was listening, it is
+  stopped then restarted after playback ends — no self-trigger, no echo. Reuses
+  the M2/M3 primitives (`wake.pause()`, `stop_listening()`/`start_listening()`).
+- **Events.** `speech.tts` notifications (`starting`/`speaking`/`done`/`cancelled`/`error`)
+  flow on the existing `/stream/stt` WebSocket — not a separate endpoint, and
+  there is no stream id (one active playback at a time).
+
+The old planned-API sketch (`synthesize_stream`/`tts_chunk` RPC + a separate
+WS `/stream/tts` with stream ids) is collapsed into the above.
 
 ## 9. Configuration & Runtime State
 
@@ -253,6 +322,16 @@ Key fields: `port`, `socket_path`, `sample_rate`, `stt_model`, `tts_model`,
 - `audio_lane` — `{tts, stt, probed, error}` from the startup probe.
 - `listening` — mic capture armed (M2).
 - `hotwords` — registered wake phrases (M3).
+- `wake_armed` — wake detection armed (M3).
+- `speaking` — TTS playback active (M4).
+- `_wake` — the active `WakeWordEngine`, lazily built on `speech.wake {arm:true}`,
+  torn down on disarm/daemon stop.
+- `_listener` — the active `StreamingListener`, lazily built on
+  `speech.start_listening`, torn down on stop/daemon stop.
+- `_player` — the active `StreamingPlayer`, lazily built on `speech.speak`,
+  torn down on stop/daemon stop (M4).
+- `_subscribers` — set of per-WS-client `asyncio.Queue` for `/stream/stt`
+  fan-out; `subscribe`/`unsubscribe`/`broadcast` manage it.
 - `_server`, `_app`, `_http_task` — owned asyncio/uvicorn handles.
 
 Socket dir default `~/.fusion-speech/run` (0o700); socket file 0o600. Log dir
@@ -296,12 +375,27 @@ after merge.
   fusion-mlx discovery fix, issue #649). (uses key from settings.json; start/stop
   fusion-mlx via `~/claude-home/fusion-mlx/start.sh`)
 - **M2** — realtime mic capture + streaming ASR: ring_buffer, audio_source, vad,
-  stt_stream, `speech.asr`, WS `/stream/stt`.
-- **M3** — hotword wake: wake_word, `set_hotwords`/`wake`, two-level filter.
-- **M4** — streaming TTS playback: tts_playback, `synthesize_stream`/`tts_chunk`,
-  WS `/stream/tts`.
+  stt_stream, `speech.asr`, WS `/stream/stt`. **done** — ring buffer (SPSC,
+  drop-oldest), energy-gate + Silero ONNX VAD (64-sample context fix), streaming
+  listener (capture-mirror → segment → WAV → transcribe → final notification),
+  `/stream/stt` WS subscriber fan-out, `speech.start_listening`/`stop_listening`
+  RPC. Verified: 55 tests green (incl. real-load Silero on speech fixture +
+  end-to-end start→capture→transcribe→final-to-subscriber integration).
+- **M3** — hotword wake: `wake_word.py` (openwakeword ONNX), `set_hotwords`/`wake`
+  RPC, auto-listen handshake. **done** — WakeWordEngine (shared mic ring, 80ms
+  frame drain, predict→on_wake with debounce cooldown, pause/resume for ASR
+  coexistence, fail-soft), WakeModelDownloader (httpx, configurable mirror URL),
+  `speech.wake`/`set_hotwords` RPC + `speech.wake` notification on `/stream/stt`.
+  Coexistence: wake paused during ASR, auto-start ASR on wake for
+  `wake_auto_listen_s` then resume. Verified: 72 tests green incl. real-load
+  (downloads hey_jarvis ONNX, 2s silence → no false wake).
+- **M4** — streaming TTS playback: `tts_playback.py`, `speech.speak`/`speech.stop_tts`
+  RPC, `speech.tts` events on `/stream/stt`. **done** — StreamingPlayer
+  (fetch→resample 24k→16k→bounded queue→writer→`sounddevice.OutputStream`,
+  TTFA on first chunk, cancel, fail-soft), mic guard (pause wake / stop-restart
+  ASR), `speech.tts` events (starting/speaking/done/cancelled/error) on
+  `/stream/stt`. Verified: 83 tests green incl. real-load (Kokoro via fusion-mlx,
+  fake output, headless).
 - **M5** — fusion-studio integration: SpeechBridge.swift, mic permission,
   port-registry `11465`. Upstream issue → PR.
 - **M6** — tests, integration (real fusion-mlx start/stop), final docs.
-
-## 12. Milestone Plan
