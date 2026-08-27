@@ -1,5 +1,7 @@
 # fusion-speech
 
+> [English](README.md) | [中文](README_CN.md)
+
 > Local-first low-latency speech daemon for the Fusion ecosystem.
 
 Local-first speech service: speech-to-text, text-to-speech, hotword wake, realtime
@@ -208,6 +210,12 @@ curl http://127.0.0.1:11465/metrics
 Only this project's directory is modified. Upstream fusion-mlx / fusion-studio /
 port-registry changes go through issue first, then PR.
 
+For scenario-based integration recipes (Python/Swift UDS clients for transcribe,
+synthesize, wake, streaming ASR/TTS), see
+[`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md). For developer setup,
+testing, style, and the upstream issue→PR workflow, see
+[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
+
 ## Testing
 
 Unit + adversarial gate suite run offline (no model load, no live daemon):
@@ -247,6 +255,9 @@ The real-load suite is a 5-step full-chain gate over UDS JSON-RPC:
 Test fixtures live in `tests/fixtures/` (kept as final artifacts). The UDS
 client helper is `tests/_uds_client.py`; the `real_daemon` session fixture
 (spawn via `start.sh`, real socket/port) is in `tests/conftest.py`.
+
+Developer setup, test commands, lint, and code style are documented in
+[`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md).
 
 ## Status
 
@@ -409,5 +420,10 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
     step 2 skips (not xfails) so the gate is green upstream-side and flips to
     a real assertion on the fix. TTS path unaffected.
   - Verified: 148 tests green, 5 skipped (real_load-gated), ruff clean.
+
+- **0.1.1** — bilingual docs (Chinese `README_CN.md`), scenario-based
+  [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) and developer
+  [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md); patch over 0.1.0rc1. No runtime
+  change. Known upstream limit: fusion-mlx issue #668 (STT 500) — see Testing.
 
 License: Apache-2.0.

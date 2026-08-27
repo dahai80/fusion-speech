@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "fusion-speech"
-version = "0.1.0rc1"
+version = "0.1.1"
 license = "Apache-2.0"
 description = "Local-first low-latency speech daemon (streaming STT/TTS/wake), delegates inference to fusion-mlx"
 requires-python = ">=3.12"
