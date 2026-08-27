@@ -200,7 +200,9 @@ curl http://127.0.0.1:11465/metrics
   `http.app.create_app` for the FastAPI factory, `config` for base URL / API key
   resolution, `logging` for log setup.
 - **fusion-studio** (Swift desktop, M5): calls the daemon over UDS JSON-RPC;
-  registers a SpeechBridge + mic permission. Upstream change, filed as issue then PR.
+  registers a SpeechBridge + mic permission. Upstream change — issue
+  dahai80/fusion-studio#337 filed; Swift PR to follow per the upstream-first
+  workflow.
 - **port-registry**: claims `11465` in `architecture/port-registry.yaml` (M5).
 
 Only this project's directory is modified. Upstream fusion-mlx / fusion-studio /
@@ -347,7 +349,13 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
 `tests/test_metrics.py`, `tests/test_state.py`, `tests/test_r6_graceful_drain.py`
 + the prior gate suites), ruff clean.
 
-- **M5** — fusion-studio integration (upstream issue/PR)
-- **M6** — tests, integration, docs
+- **M5** — fusion-studio integration
+  - Port `11465` registered in `architecture/port-registry.yaml` (check-ports CI
+    green for fusion-speech).
+  - Upstream issue filed: dahai80/fusion-studio#337 — requests a `SpeechBridge`
+    Swift class (UDS JSON-RPC client) + mic permission + `/stream/stt` event
+    subscription. Swift implementation is out of this project's scope (upstream
+    issue-first → PR per workflow).
+- **M6** — tests, integration, docs (pending)
 
 License: Apache-2.0.
