@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from collections.abc import Callable
@@ -138,7 +139,13 @@ class SileroVadEngine:
         return self._energy_only
 
     def reset(self) -> None:
-        self._buffer = np.empty(0, dtype=np.float32)
+        # Pre-allocated scratch buffer + write cursor (_len). feed() copies new
+        # samples in at _len (O(chunk), not O(buffer) like np.concatenate), and
+        # consumes windows by shifting the < window tail to the front (O(window),
+        # bounded) — avoids the per-feed quadratic realloc of the old concat
+        # (audit P2). Capacity grows lazily; never shrinks.
+        self._buf = np.empty(self.window * 4, dtype=np.float32)
+        self._len = 0
         self._in_speech = False
         self._speech_start = 0
         self._temp_end = 0
@@ -147,12 +154,40 @@ class SileroVadEngine:
             self._model.reset_state()
 
     def feed(self, samples: np.ndarray) -> None:
+        self._feed_sync(samples)
+
+    async def feed_async(self, samples: np.ndarray) -> None:
+        # F-VAD-LOOP: the ONNX predict (_speech_prob -> self._model(window)) is
+        # a ~5-15ms synchronous call. When feed() runs on the drain task (the
+        # asyncio loop), that blocks ASR-final push + WS writes during active
+        # speech. Push the whole window-processing batch to the executor as one
+        # sync unit so recurrent state (_state/_context) stays coherent (single
+        # drain task awaits sequentially -> no two _feed_sync run concurrently)
+        # and the loop stays free. on_open/on_close callbacks use
+        # run_coroutine_threadsafe / ensure_future(loop=) which are thread-safe.
         if samples.size == 0:
             return
-        self._buffer = np.concatenate((self._buffer, np.asarray(samples, dtype=np.float32)))
-        while self._buffer.size >= self.window:
-            window = self._buffer[: self.window]
-            self._buffer = self._buffer[self.window :]
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(None, self._feed_sync, samples)
+
+    def _feed_sync(self, samples: np.ndarray) -> None:
+        if samples.size == 0:
+            return
+        n = samples.size
+        need = self._len + n
+        if self._buf.size < need:
+            newcap = max(need, self._buf.size * 2, self.window * 4)
+            grown = np.empty(newcap, dtype=np.float32)
+            grown[: self._len] = self._buf[: self._len]
+            self._buf = grown
+        self._buf[self._len : need] = np.asarray(samples, dtype=np.float32)
+        self._len = need
+        while self._len >= self.window:
+            window = self._buf[: self.window].copy()
+            tail = self._len - self.window
+            if tail > 0:
+                self._buf[:tail] = self._buf[self.window : self._len]
+            self._len = tail
             self._process_window(window)
 
     def _process_window(self, window: np.ndarray) -> None:
@@ -228,7 +263,7 @@ class SileroVadEngine:
         return {
             "energy_only": self._energy_only,
             "in_speech": self._in_speech,
-            "buffered": int(self._buffer.size),
+            "buffered": int(self._len),
             "total_samples": self._total_samples,
             "window": self.window,
             "threshold": self.cfg.threshold,

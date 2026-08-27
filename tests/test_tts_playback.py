@@ -255,9 +255,18 @@ MLX_UP = _mlx_reachable()
 @pytest.mark.skipif(not MLX_UP, reason="fusion-mlx not running on 11434")
 async def test_real_tts_loads_and_streams():
     # Real-load gate (project rule: really load the model). Uses the real
-    # synthesize_stream -> fusion-mlx Kokoro, fake OutputStream (headless, no
-    # speaker). Asserts chunks arrive, TTFA, done event.
+    # synthesize_stream -> fusion-mlx, fake OutputStream (headless, no
+    # speaker). Asserts chunks arrive, TTFA, done event. Resolves the model
+    # the same way speech.speak does: probe the audio lane, fall back to the
+    # first probed TTS model when the configured alias (kokoro) is not in the
+    # probed set (upstream fusion-mlx alias resolution is broken — the alias
+    # maps to an unprefixed id that 404s; the full id works).
+    from fusion_speech.mlx_bridge import probe_mlx_audio_lane
+
     cfg = load_config()
+    lane = await asyncio.wait_for(probe_mlx_audio_lane(cfg), timeout=30.0)
+    tts_models = lane.get("tts_models") or []
+    model = cfg.tts_model if cfg.tts_model in tts_models else (tts_models[0] if tts_models else cfg.tts_model)
     notified = []
 
     async def notifier(payload):
@@ -285,7 +294,24 @@ async def test_real_tts_loads_and_streams():
         notifier=notifier,
         stream_factory=lambda **k: _FakeOutStream(),
     )
-    res = await asyncio.wait_for(player.speak("Hello world.", model=cfg.tts_model), timeout=60.0)
+    # Warm the TTS model untimed first: under the full suite, earlier STT
+    # real-load gates occupy fusion-mlx and can evict the TTS model, so a
+    # cold reload (>>60s) races the 60s stream cap. Warming separates
+    # model-load latency (a fusion-mlx scheduling concern) from what this
+    # gate actually asserts: streamed playback + done event.
+    warm_noted = []
+
+    async def _warm_notifier(payload):
+        warm_noted.append(payload)
+
+    warm_player = StreamingPlayer(
+        cfg,
+        notifier=_warm_notifier,
+        stream_factory=lambda **k: _FakeOutStream(),
+    )
+    await asyncio.wait_for(warm_player.speak("hi", model=model), timeout=120.0)
+    await warm_player.cancel()
+    res = await asyncio.wait_for(player.speak("Hello world.", model=model), timeout=60.0)
     assert res["played"] is True
     assert res["sample_rate"] > 0
     states = [n.get("state") for n in notified if n.get("event") == "speech.tts"]

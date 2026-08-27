@@ -55,7 +55,12 @@ class StreamingPlayer:
         self._active = True
         self._cancelled = False
         self._sample_rate = 0
-        cap = max(1, int(self.config.tts_playback_buffer_s * self.config.sample_rate))
+        # clamp buffer_s to a sane upper bound; lower-bound the cap at 1 so a
+        # zero/tiny buffer cannot degenerate into a 0-slot queue (audit P1),
+        # but do not force a 0.1s floor — a legitimately small buffer (e.g.
+        # 0.05s for low-latency playback) must keep its configured cap.
+        buffer_s = min(10.0, max(0.0, float(self.config.tts_playback_buffer_s)))
+        cap = max(1, int(buffer_s * self.config.sample_rate))
         self._queue = asyncio.Queue(maxsize=cap)
         await self._notify({"event": "speech.tts", "state": "starting", "chars": len(text)})
         self._fetch_task = asyncio.create_task(self._fetch_loop(text, voice, model))
@@ -203,10 +208,20 @@ class StreamingPlayer:
 def _resample(pcm: np.ndarray, src_rate: int, dst_rate: int) -> np.ndarray:
     if src_rate == dst_rate or pcm.size == 0:
         return pcm
-    n_out = int(round(pcm.size * dst_rate / src_rate))
-    if n_out <= 0:
-        return np.empty(0, dtype=np.float32)
-    idx = np.linspace(0, pcm.size - 1, n_out)
-    out = np.interp(idx, np.arange(pcm.size), pcm).astype(np.float32)
-    logger.debug("resample %d -> %d (%d samples)", src_rate, dst_rate, out.size)
+    # Prefer scipy's polyphase resampler (anti-aliased, correct). Fall back to
+    # linear interp if scipy is unavailable — log loudly once (audit P1: linear
+    # interp aliases when downsampling).
+    try:
+        from scipy.signal import resample_poly
+    except Exception as e:
+        logger.warning("scipy unavailable, falling back to linear resample: %s", e)
+        n_out = int(round(pcm.size * dst_rate / src_rate))
+        if n_out <= 0:
+            return np.empty(0, dtype=np.float32)
+        idx = np.linspace(0, pcm.size - 1, n_out)
+        out = np.interp(idx, np.arange(pcm.size), pcm).astype(np.float32)
+        logger.debug("resample(linear) %d -> %d (%d samples)", src_rate, dst_rate, out.size)
+        return out
+    out = resample_poly(pcm, dst_rate, src_rate).astype(np.float32, copy=False)
+    logger.debug("resample(poly) %d -> %d (%d samples)", src_rate, dst_rate, out.size)
     return out

@@ -9,7 +9,8 @@ logger = _core_config.logger
 
 
 class RingBuffer:
-    """Lock-free SPSC ring for realtime PCM audio.
+    """GIL-protected SPSC ring for realtime PCM audio (CPython only; a
+    free-threaded build would need a real lock — re-audit before enabling).
 
     Producer = sounddevice callback (realtime thread, must never block).
     Consumer = asyncio task draining into VAD. Single producer, single
@@ -18,7 +19,8 @@ class RingBuffer:
     are unambiguous (full = in-out == capacity, empty = in == out); ring
     indices wrap modulo capacity only for buffer access. On overflow the
     oldest samples are dropped (realtime capture must never block); the
-    overrun counter is surfaced in speech.status.
+    overrun counter is surfaced in speech.status. The in/out counters are
+    plain ints mutated under the GIL — not atomic on a free-threaded runtime.
     """
 
     def __init__(self, capacity_samples: int, dtype: np.dtype = np.float32):
@@ -61,6 +63,10 @@ class RingBuffer:
         n = samples.size
         if n == 0:
             return 0
+        # Overflow path runs on the PortAudio realtime thread (write() is
+        # called from _on_audio). P2-1: no I/O here — only bump counters.
+        # Overruns are surfaced in AudioSource.stop() (asyncio-side) and
+        # via stats() for any consumer that wants to poll.
         free = self._capacity - self.available()
         dropped = 0
         if n > free:
@@ -68,11 +74,6 @@ class RingBuffer:
             self._overruns += 1
             self._total_dropped += dropped
             self._total_out += dropped
-            logger.warning(
-                "ring overflow: dropping %d oldest samples (overruns=%d)",
-                dropped,
-                self._overruns,
-            )
         w = self._total_in % self._capacity
         first = min(n, self._capacity - w)
         self._buf[w : w + first] = samples[:first]
@@ -112,7 +113,7 @@ class RingBuffer:
         self._total_out = 0
         self._overruns = 0
         self._total_dropped = 0
-        self._closed = False
+        # a closed ring stays closed — reset must not revive it (audit A3)
 
     def close(self) -> None:
         self._closed = True

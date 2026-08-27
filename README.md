@@ -87,7 +87,7 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_TTS_MODEL` | `kokoro` | TTS model id (fusion-mlx alias) |
 | `FUSION_SPEECH_TTS_VOICE` | `af_heart` | TTS voice |
 | `FUSION_SPEECH_LANGUAGE` | `en` | default STT language (set `zh` with `openai/whisper-large-v3`) |
-| `FUSION_SPEECH_SAMPLE_RATE` | `16000` | capture sample rate |
+| `FUSION_SPEECH_SAMPLE_RATE` | `16000` | capture sample rate — hard-locked 16000 (VAD/wake/openwakeword contract); non-16000 fails startup |
 | `FUSION_SPEECH_VAD_THRESHOLD` | `0.3` | VAD speech threshold |
 | `FUSION_SPEECH_CHUNK_MS` | `300` | streaming chunk size |
 | `FUSION_SPEECH_WAKE_WORD` | `hey_jarvis` | default wake word (pretrained: alexa/hey_mycroft/hey_jarvis/hey_rhasspy/timer/weather) |
@@ -98,6 +98,10 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_WAKE_MODEL_URL` | GitHub releases v0.5.1 | wake model download base URL (override for a mirror) |
 | `FUSION_SPEECH_TTS_BUFFER_S` | `2.0` | TTS playback buffer cap (seconds) |
 | `FUSION_SPEECH_TTS_OUTPUT_DEVICE` | (system default) | sounddevice output device |
+| `FUSION_SPEECH_WS_KEEPALIVE_S` | `30.0` | `/stream/stt` WebSocket idle keepalive interval (sec) |
+| `FUSION_SPEECH_WS_SUBSCRIBER_QUEUE` | `64` | per-subscriber push-queue depth (drop-oldest on full) |
+| `FUSION_SPEECH_WAKE_CHUNK_SAMPLES` | `1280` | fixed wake frame size — must be 1280 (openwakeword 80ms contract); non-1280 fails startup |
+| `FUSION_SPEECH_PROBE_INTERVAL_S` | `60.0` | background audio-lane re-probe interval (sec) |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -119,12 +123,15 @@ JSON-RPC 2.0 over UDS, newline-delimited. Peer UID verified (fail-closed).
 | `speech.wake` | `{arm: true\|false}` | `{armed: bool, words: [...]}` — arm/disarm wake detection |
 | `speech.speak` | `{text, voice?, model?}` | `{played, chars, sample_rate}` — streams TTS to the speaker (pauses mic) |
 | `speech.stop_tts` | `{}` | `{stopped}` — cancel active playback |
+| `speech.reprobe` | `{}` | `{audio_lane}` — re-probe the fusion-mlx audio lane on demand (refreshes `list_models` cache) |
 
 M2 realtime push: connect WebSocket `/stream/stt` to receive `speech.asr`
 notification frames (`listening` → `speaking` → `transcribing` → `final`, or
-`error`; `keepalive` every 30s idle). M3 adds `speech.wake` notifications on the
-same socket (then auto-starts ASR for the listen window). M4 adds speech.tts
-progress events on the same socket.
+`error`). M3 adds `speech.wake` notifications on the same socket (then
+auto-starts ASR for the listen window). M4 adds `speech.tts` progress events
+on the same socket. Keepalive is its own event type — `{"event":
+"speech.keepalive"}` every `FUSION_SPEECH_WS_KEEPALIVE_S` idle, distinct from
+`speech.asr` so clients can tell keepalive apart from real audio events.
 
 ### Wake (M3)
 
@@ -154,6 +161,35 @@ out-of-box even when fusion-mlx's loaded model differs from the configured defau
 
 Error codes follow JSON-RPC 2.0: `-32700` parse error, `-32600` invalid request,
 `-32601` method not found, `-32603` internal error, `-32000` handler error.
+
+## Metrics
+
+`GET /metrics` on the HTTP port (`127.0.0.1:11465`) returns Prometheus text
+exposition (zero-dependency, hand-written — no `prometheus_client` added). Every
+RPC handler is timed and counted; the listener, wake engine, and TTS player
+report state gauges; the ASR/TTS bridges report throughput.
+
+| Metric | Type | Labels | What it measures |
+|---|---|---|---|
+| `rpc_requests_total` | Counter | `method` | RPC calls per method |
+| `rpc_errors_total` | Counter | `method` | RPC handler errors per method |
+| `rpc_duration_seconds` | Histogram | `method` | RPC handler latency (seconds) |
+| `asr_segments_total` | Counter | — | ASR segments closed (VAD segment-close) |
+| `asr_transcribe_seconds` | Histogram | — | per-segment transcribe latency |
+| `asr_segments_dropped_total` | Counter | — | segments dropped by R4 backpressure |
+| `wake_fires_total` | Counter | — | wake-word fires |
+| `tts_speak_total` | Counter | — | `speech.speak` invocations |
+| `subscribers` | Gauge | — | current WS/event subscribers |
+| `listening` | Gauge | — | 1 when ASR listener active, else 0 |
+| `wake_armed` | Gauge | — | 1 when wake engine armed, else 0 |
+| `speaking` | Gauge | — | 1 when TTS player active, else 0 |
+
+`speech.status` also returns a metrics summary (`uptime`, `rpc_total`,
+`errors_total`). Scrape with:
+
+```bash
+curl http://127.0.0.1:11465/metrics
+```
 
 ## Integration
 
@@ -228,6 +264,89 @@ Milestone progress:
   - RPC: `speech.speak`, `speech.stop_tts`; `speech.tts` events
     (starting/speaking/done/cancelled/error) on `/stream/stt`.
   - Verified: ~80+ tests green incl. real-load (Kokoro via fusion-mlx, fake output, headless).
+
+### Hardening (P0-P3 audit pass)
+
+Adversarial audit (`audit/fusion-speech-audit-0827.md`, 13 findings across
+FATAL/LOGIC/ARCH/PERF/MAINT) fully fixed. No public contract changed; this
+pass tightens security, correctness, and resource handling:
+
+- **F1 (FATAL)** — wake never fired: `wake_word._resolve_score_keys` now reads
+  the real openwakeword `class_mapping`/`models` keys (`hey_jarvis_v0.1`) and
+  matches by prefix, instead of `splitext(word)[0]` which stripped `.1`.
+- **F2 (FATAL)** — IPC auth fail-open: `_verify_peer_uid` rejects when the
+  socket is missing (fail-closed, was `return True`).
+- **F3 (FATAL)** — unbounded-line DoS: `handle_client` caps a line at 1 MiB
+  and closes the connection on overflow (bytearray buffer, no O(n²) copy).
+- **M1** — HTTP retry: `mlx_bridge` retries transient failures (5xx /
+  `TransportError` / `TimeoutException`) with 0.5/1.0/2.0s backoff; 4xx not
+  retried; stream retry is connection-only (no double playback).
+- **M2** — input size limits: `speech.transcribe` rejects audio >25 MB,
+  `speech.speak`/`synthesize` reject text >5000 chars (`-32000`).
+- **M3** — socket unlink TOCTOU: `server.start` suppresses `FileNotFoundError`
+  on the stale-socket unlink.
+- **L1/L2/L3** — wake auto-listen window is interruptible on ASR `final`; wake
+  resume guarded against `None`; subscriber queue bounded at 64 (drop-oldest).
+- **A1** — in-flight transcribe tasks are tracked, sem-limited (2), and
+  cancelled/cleared on `stop()` (no orphans).
+- **A2/A3/P2-1** — realtime capture callback writes a view (no per-frame
+  alloc); shared ring not closed by a borrowing listener; ring overflow
+  path in `write()` no longer logs I/O on the PortAudio thread (counters
+  only; overruns surfaced in `stop()` and `stats()`). The ring notifier
+  is unset in production — consumers poll the ring (`_drain_loop` every
+  20ms), so the notifier is never called from the realtime callback.
+- **P1** — TTS resample uses `scipy.signal.resample_poly` (anti-aliased);
+  fail-soft to `np.interp` if scipy is absent. Queue cap clamped to [1, 10s].
+- **P2** — VAD `feed` uses a pre-allocated buffer (no quadratic realloc).
+- **P3** — `collect_pcm` trims by whole chunk (no second full-copy).
+
+Verified: 93 tests green incl. adversarial gate suite (`tests/test_audit_fixes.py`)
+and real-load gates (openwakeword ONNX silence, fusion-mlx STT/TTS).
+
+### Architecture audit (5 waves, 20 findings)
+
+Architecture audit (`audit/fusion-speech-audit-report-0827.md`, verdict: not
+commercial-ready) fully remediated. 20 findings: 5 architecture (H), 7 runtime
+risk (R), 8 engineering defect (E). No public RPC contract changed; the one
+addition (`speech.reprobe`) is non-breaking. See `docs/ARCHITECTURE.md` §3a for
+the component split and §12 (M4-hardening) for the wave-by-wave breakdown.
+
+- **Wave 2 — god-object split (H1/H3/H4)**: `SpeechDaemon` split into a thin
+  facade + 5 leaf services (`AsrService`/`WakeService`/`TtsService`/`AudioBus`/
+  `EventBus`) under `fusion_speech/components/`. Mic ownership centralized in
+  `AudioBus` (acquire/release, no shared-source racy peek). Lazy imports of
+  engine modules promoted to top-level (import graph verified acyclic).
+- **Wave 3 — concurrency correctness (H5/R3/R4/E7)**: per-service
+  `asyncio.Lock` on state-mutating ops; facade `_handshake_lock` serializes the
+  wake→ASR handshake (kills the double-wake check-then-act tear). ASR-final
+  handshake frames delivered out-of-band via a per-handshake token registry
+  (slow TTS drop-oldest can no longer drop the final frame). `_on_close` task
+  creation bounded (Semaphore(4), drop + log on overflow). 6 concurrency tests
+  added.
+- **Wave 4 — observability + shutdown + persistence (E2/R6/E8/E6)**:
+  zero-dependency `/metrics` (see above). Bounded shutdown drain: broadcast
+  `speech.shutdown`, wait-for WS close with a 10s cap, cancel stragglers.
+  `start.sh` stop grace raised 3s → 15s to absorb the drain. Persistent
+  `~/.fusion-speech/run/state.json` (`start_time`/`restart_count`); on a
+  crash-restart the daemon broadcasts `speech.restarted`.
+- **Wave 5 — config/probe/error/wake-frame (E4/E1/E3/R5/H2/R7/E5)**:
+  `SpeechConfig.__post_init__` fail-loud validation (sample_rate==16000,
+  channels==1, port range, thresholds, fixed 1280 wake frame) — non-16000
+  startup now fails instead of silently corrupting VAD/wake. `speech.reprobe`
+  RPC + background re-probe loop (kills stale `audio_lane`). Malformed HTTP-200
+  bodies (non-JSON STT, zero-rate WAV TTS) raise `AudioBridgeError` carrying
+  the status instead of a bare `JSONDecodeError`/garbage playback. Wake/ASR
+  resume failure after `speech.speak` broadcasts a `speech.tts` error event
+  with `degraded: true` and latches `tts.degraded` (cleared on clean resume).
+  Keepalive is a distinct `speech.keepalive` event type. Wake drain reads a
+  fixed 1280-sample frame (was variable `available % 1280` → openwakeword
+  probability corruption). Keepalive/queue depth now config-driven.
+
+Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.py`,
+`tests/test_r7_fixed_chunk_read.py`, `tests/test_concurrency.py`,
+`tests/test_metrics.py`, `tests/test_state.py`, `tests/test_r6_graceful_drain.py`
++ the prior gate suites), ruff clean.
+
 - **M5** — fusion-studio integration (upstream issue/PR)
 - **M6** — tests, integration, docs
 

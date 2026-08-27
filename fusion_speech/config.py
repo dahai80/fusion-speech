@@ -25,6 +25,13 @@ DEFAULT_WAKE_DEBOUNCE_S = 1.0
 DEFAULT_WAKE_MODEL_DIR = "~/.fusion-speech/models/wakeword"
 DEFAULT_WAKE_MODEL_URL = "https://github.com/dscripka/openWakeWord/releases/download/v0.5.1"
 DEFAULT_TTS_BUFFER_S = 2.0
+DEFAULT_WS_KEEPALIVE_S = 30.0
+DEFAULT_WS_SUBSCRIBER_QUEUE = 64
+DEFAULT_WAKE_CHUNK_SAMPLES = 1280
+DEFAULT_PROBE_INTERVAL_S = 60.0
+REQUIRED_SAMPLE_RATE = 16000
+REQUIRED_CHANNELS = 1
+REQUIRED_WAKE_CHUNK = 1280
 
 
 def _env_int(key: str, default: int) -> int:
@@ -82,11 +89,60 @@ class SpeechConfig:
     tts_playback_buffer_s: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_TTS_BUFFER_S", DEFAULT_TTS_BUFFER_S)
     )
+    ws_keepalive_s: float = field(
+        default_factory=lambda: _env_float("FUSION_SPEECH_WS_KEEPALIVE_S", DEFAULT_WS_KEEPALIVE_S)
+    )
+    ws_subscriber_queue: int = field(
+        default_factory=lambda: _env_int("FUSION_SPEECH_WS_SUBSCRIBER_QUEUE", DEFAULT_WS_SUBSCRIBER_QUEUE)
+    )
+    wake_chunk_samples: int = field(
+        default_factory=lambda: _env_int("FUSION_SPEECH_WAKE_CHUNK_SAMPLES", DEFAULT_WAKE_CHUNK_SAMPLES)
+    )
+    probe_interval_s: float = field(
+        default_factory=lambda: _env_float("FUSION_SPEECH_PROBE_INTERVAL_S", DEFAULT_PROBE_INTERVAL_S)
+    )
     tts_output_device: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
     log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
         default_factory=lambda: os.path.expanduser(os.environ.get("FUSION_SPEECH_LOG_DIR", "~/.fusion-speech/logs"))
     )
+
+    def __post_init__(self) -> None:
+        # E4: fail-loud validation. Audio pipeline (Silero VAD + openwakeword)
+        # hard-contracts 16k mono + 1280-sample (80ms) wake frames. A non-16000
+        # sample_rate or non-mono channels silently corrupts detection; raise so
+        # startup fails instead of running broken. Other fields bound-checked to
+        # catch bad env values early (negative buffers, out-of-range thresholds).
+        if self.sample_rate != REQUIRED_SAMPLE_RATE:
+            raise ValueError(
+                f"sample_rate must be {REQUIRED_SAMPLE_RATE} (VAD/wake/openwakeword contract), got {self.sample_rate}"
+            )
+        if self.channels != REQUIRED_CHANNELS:
+            raise ValueError(f"channels must be {REQUIRED_CHANNELS} (mono pipeline), got {self.channels}")
+        if not 0 < self.wake_threshold <= 1:
+            raise ValueError(f"wake_threshold must be in (0, 1], got {self.wake_threshold}")
+        if self.wake_auto_listen_s <= 0:
+            raise ValueError(f"wake_auto_listen_s must be > 0, got {self.wake_auto_listen_s}")
+        if self.wake_debounce_s < 0:
+            raise ValueError(f"wake_debounce_s must be >= 0, got {self.wake_debounce_s}")
+        if not 0 < self.vad_speech_threshold < 1:
+            raise ValueError(f"vad_speech_threshold must be in (0, 1), got {self.vad_speech_threshold}")
+        if not 0 < self.tts_playback_buffer_s <= 10:
+            raise ValueError(f"tts_playback_buffer_s must be in (0, 10], got {self.tts_playback_buffer_s}")
+        if self.chunk_ms <= 0:
+            raise ValueError(f"chunk_ms must be > 0, got {self.chunk_ms}")
+        if not 0 <= self.port <= 65535:
+            raise ValueError(f"port must be in [0, 65535] (0 = ephemeral), got {self.port}")
+        if self.wake_chunk_samples != REQUIRED_WAKE_CHUNK:
+            raise ValueError(
+                f"wake_chunk_samples must be {REQUIRED_WAKE_CHUNK} (openwakeword 80ms frame contract), got {self.wake_chunk_samples}"
+            )
+        if self.ws_keepalive_s <= 0:
+            raise ValueError(f"ws_keepalive_s must be > 0, got {self.ws_keepalive_s}")
+        if self.ws_subscriber_queue <= 0:
+            raise ValueError(f"ws_subscriber_queue must be > 0, got {self.ws_subscriber_queue}")
+        if self.probe_interval_s <= 0:
+            raise ValueError(f"probe_interval_s must be > 0, got {self.probe_interval_s}")
 
 
 def _resolve_socket_path() -> str:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import time
 import wave
 from collections.abc import Awaitable, Callable
 from io import BytesIO
@@ -10,6 +11,7 @@ from io import BytesIO
 import numpy as np
 
 from fusion_speech.audio_source import AudioSource
+from fusion_speech.metrics import metrics
 from fusion_speech.ring_buffer import RingBuffer
 from fusion_speech.vad import SileroVadEngine, VadSegment
 
@@ -69,6 +71,15 @@ class StreamingListener:
         self._capture_start: int | None = None
         self._segment_seq = 0
         self._loop: asyncio.AbstractEventLoop | None = None
+        self._transcribe_tasks: set[asyncio.Task] = set()
+        # R4: bound in-flight segment transcribes at CREATION, not just
+        # execution. The old Semaphore(2) gated _transcribe_segment's body but
+        # _on_close created a task per close unbounded -> long speech + slow
+        # mlx piled tasks. A single inflight counter (mutated only on the loop
+        # thread) caps creation at _max_inflight; overflow drops the segment
+        # with a warning (backpressure).
+        self._inflight = 0
+        self._max_inflight = 4
 
     @property
     def active(self) -> bool:
@@ -114,6 +125,19 @@ class StreamingListener:
             with contextlib.suppress(asyncio.CancelledError):
                 await self._drain_task
             self._drain_task = None
+        # cancel any in-flight segment transcribes so they don't outlive the
+        # session as orphan tasks (audit A1). R6: bound the gather so a wedged
+        # mlx transcribe cannot hang stop beyond DRAIN_TIMEOUT; leftover tasks
+        # are cancelled (gather above already fired cancel on each).
+        for t in list(self._transcribe_tasks):
+            t.cancel()
+        if self._transcribe_tasks:
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.gather(*self._transcribe_tasks, return_exceptions=True),
+                    timeout=10.0,
+                )
+        self._transcribe_tasks.clear()
         self.vad.flush()
         if self._own_source:
             self.source.stop()
@@ -130,7 +154,7 @@ class StreamingListener:
                 chunk = self.ring.read(self.ring.available())
                 if chunk.size > 0:
                     self._capture.append(chunk)
-                    self.vad.feed(chunk)
+                    await self.vad.feed_async(chunk)
                 else:
                     await asyncio.sleep(0.02)
         except asyncio.CancelledError:
@@ -150,12 +174,30 @@ class StreamingListener:
             )
 
     def _on_close(self, segment: VadSegment) -> None:
-        # Called on the drain task (asyncio thread) — safe to await directly.
+        # Called on the drain task (asyncio thread) — safe to schedule directly.
+        # May also be reached from flush() (still loop thread). R4: cap creation.
         if self._loop is None:
             return
         self._segment_seq += 1
         seq = self._segment_seq
-        asyncio.ensure_future(self._transcribe_segment(segment, seq), loop=self._loop)
+        if self._inflight >= self._max_inflight:
+            logger.warning(
+                "segment %d dropped: %d inflight >= cap %d (backpressure)",
+                seq,
+                self._inflight,
+                self._max_inflight,
+            )
+            metrics.asr_segments_dropped_total.inc()
+            return
+        self._inflight += 1
+        task = asyncio.ensure_future(self._transcribe_segment(segment, seq), loop=self._loop)
+        self._transcribe_tasks.add(task)
+
+        def _done(t: asyncio.Task) -> None:
+            self._transcribe_tasks.discard(t)
+            self._inflight = max(0, self._inflight - 1)
+
+        task.add_done_callback(_done)
 
     async def _transcribe_segment(self, segment: VadSegment, seq: int) -> None:
         # gate on the VAD's pure-speech length (segment.samples), not the
@@ -194,6 +236,8 @@ class StreamingListener:
                 "duration": round(pcm.size / self.config.sample_rate, 3),
             }
         )
+        metrics.asr_segments_total.inc()
+        t0 = time.monotonic()
         try:
             result = await self._transcribe(
                 self.config,
@@ -202,6 +246,7 @@ class StreamingListener:
                 language=self.config.language,
             )
         except Exception as e:
+            metrics.asr_transcribe_seconds.observe(time.monotonic() - t0)
             logger.exception("segment %d transcribe failed", seq)
             await self._notify(
                 {
@@ -212,6 +257,7 @@ class StreamingListener:
                 }
             )
             return
+        metrics.asr_transcribe_seconds.observe(time.monotonic() - t0)
         text = (result.get("text") or "").strip()
         logger.info("segment %d final: %r", seq, text[:120])
         await self._notify(
@@ -230,6 +276,8 @@ class StreamingListener:
         # not the ring — the ring is already drained by the consumer task and
         # may have drop-oldest truncated long segments. _capture grows
         # unbounded only for the session; trim it after each segment below.
+        # Trim drops whole consumed chunks rather than re-slicing+copying the
+        # full buffer (audit P3) — avoids the quadratic full[cut:].copy().
         if not self._capture:
             return np.empty(0, dtype=np.float32)
         full = np.concatenate(self._capture)
@@ -237,13 +285,30 @@ class StreamingListener:
         if start >= full.size:
             return np.empty(0, dtype=np.float32)
         pcm = full[start:].astype(np.float32, copy=False)
-        # trim the consumed prefix so _capture does not grow without bound;
-        # keep a small tail (last 0.2s) as lead-in for the next segment.
         keep = min(int(self.config.sample_rate * 0.2), pcm.size)
         cut = full.size - keep
-        if cut > 0:
-            self._capture = [full[cut:].copy()]
-            self._capture_start = 0
+        if cut <= 0:
+            return pcm
+        # Drop consumed leading chunks wholesale; retain the tail crossing cut
+        # as a single (possibly partial) chunk so the next segment keeps its
+        # lead-in without a full-buffer copy.
+        new_capture: list[np.ndarray] = []
+        running = 0
+        for chunk in self._capture:
+            n = chunk.size
+            if running + n <= cut:
+                running += n
+                continue
+            if running < cut:
+                offset = cut - running
+                new_capture.append(chunk[offset:].copy())
+            else:
+                new_capture.append(chunk)
+            running += n
+        if not new_capture:
+            new_capture = [full[cut:].copy()]
+        self._capture = new_capture
+        self._capture_start = 0
         return pcm
 
     async def _notify(self, payload: dict) -> None:

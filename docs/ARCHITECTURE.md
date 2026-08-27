@@ -28,9 +28,11 @@ One long-running asyncio daemon: `python3 -m fusion_speech.server`.
   `mlx_audio` importability, reports `{tts, stt, probed, error}` into `audio_lane`.
   Failures are non-fatal: daemon runs, but `/health` and `speech.status` flag the
   lane as down.
-- **Shutdown** — SIGINT/SIGTERM set a stop event; UDS server closes, HTTP task
-  cancels, socket file unlinked. `start.sh stop` sends SIGTERM then SIGKILL after
-  a 3s grace window.
+- **Shutdown** — SIGINT/SIGTERM set a stop event; daemon broadcasts
+  `speech.shutdown` to WS subscribers, drains each leaf (player/wake/listener/
+  UDS/http) under a bounded 10s timeout (R6), then unlinks the socket.
+  `start.sh stop` sends SIGTERM then SIGKILL after a 15s grace window (E8),
+  which accommodates the 10s drain plus fusion-mlx latency headroom.
 
 Lifecycle is owned by `start.sh` (PID file + mkdir atomic lock + process-identity
 check `*fusion_speech.server*`), mirroring the canonical `fusion-projects/start.sh`.
@@ -65,18 +67,79 @@ Modules (M1 state marked):
 
 | Module | Layer | Milestone | Status |
 |---|---|---|---|
-| `config.py` | config | M0 | done |
+| `config.py` | config | M0 | done (+ `__post_init__` fail-loud validation, E4) |
 | `logging.py` | logging (re-export fusion_core) | M0 | done |
-| `ipc/jsonrpc.py` | UDS transport + JSON-RPC dispatch | M0/M1 | done (+ typed error formatting) |
-| `ipc/methods.py` | RPC method handlers | M0/M1 | done (ping/status/transcribe/synthesize/list_models) |
-| `mlx_bridge.py` | fusion-mlx HTTP delegation | M1 | done (probe/transcribe_stream/synthesize_stream/synthesize_full) |
-| `server.py` | daemon lifecycle + FastAPI | M0/M2 | done (+ /stream/stt WS + subscriber fan-out) |
+| `ipc/jsonrpc.py` | UDS transport + JSON-RPC dispatch | M0/M1 | done (+ typed error formatting, dispatch timeout) |
+| `ipc/methods.py` | RPC method handlers | M0/M1/M5 | done (12 methods incl. `speech.reprobe`) |
+| `mlx_bridge.py` | fusion-mlx HTTP delegation | M1 | done (+ malformed-200 explicit error, E3) |
+| `metrics.py` | zero-dependency Prometheus metrics | M4-hardening | done (Counter/Gauge/Histogram, `/metrics`) |
+| `state.py` | persistent daemon state | M4-hardening | done (restart_count, `speech.restarted`) |
+| `server.py` | facade: lifecycle + orchestration | M0/M2/M4-hardening | done (SpeechDaemon thin facade, see §3a) |
+| `components/audio_bus.py` | mic ownership (H3) | Wave 2 | done |
+| `components/asr_service.py` | streaming ASR leaf | Wave 2 | done |
+| `components/wake_service.py` | hotword wake leaf | Wave 2 | done |
+| `components/tts_service.py` | TTS playback leaf | Wave 2 | done (+ R5 degraded latch) |
+| `components/event_bus.py` | subscriber fan-out + ASR-final registry | Wave 2 | done (R3 per-handshake token) |
 | `ring_buffer.py` | lock-free SPSC audio ring | M2 | done |
 | `audio_source.py` | sounddevice capture | M2 | done |
 | `vad.py` | voice activity detection | M2 | done (energy gate + Silero ONNX) |
-| `stt_stream.py` | chunked streaming ASR | M2 | done |
-| `wake_word.py` | hotword wake | M3 | done (openwakeword ONNX) |
+| `stt_stream.py` | chunked streaming ASR | M2 | done (+ R4 bounded task creation) |
+| `wake_word.py` | hotword wake | M3 | done (openwakeword ONNX, R7 fixed 1280-frame) |
 | `tts_playback.py` | streaming TTS playback | M4 | done |
+
+## 3a. Component Architecture (Wave 2 — god-object split)
+
+`SpeechDaemon` was a 386-line god-object holding every resource + all
+orchestration. The hardening audit (H1/H3/H4) split it into **five leaf
+services + one thin facade**, mirroring the `ipc/` sub-package convention.
+The facade owns lifecycle + cross-cutting orchestration only; each service
+owns one resource and its leaf operations. Dependencies form a strict DAG
+(no cycles — verified; H4 lifted lazy imports to module top).
+
+```
+                       ┌──────────────────────────────┐
+                       │ SpeechDaemon (facade)        │
+                       │  lifecycle + speak/_on_wake  │
+                       │  + property delegation       │
+                       └──┬───────┬───────┬───────┬───┘
+                          │       │       │       │
+                 ┌────────┘  ┌────┘  ┌────┘  ┌───┘
+                 ▼           ▼       ▼       ▼
+          ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
+          │AudioBus  │ │AsrService│ │WakeSvc   │ │TtsService│
+          │ (mic own)│ │(listener)│ │(engine)  │ │(player)  │
+          └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
+               │            │            │            │
+               └────────────┴───┬────────┴────────────┘
+                                ▼
+                         ┌─────────────┐
+                         │  EventBus   │  (subscribe/publish,
+                         │  + asr-final │   per-handshake handler
+                         │   registry  │   registry — R3)
+                         └─────────────┘
+```
+
+- **AudioBus** (H3) — sole mic owner. `acquire()`/`release()` borrow the
+  shared `AudioSource`; ASR and wake never peek each other's source.
+- **AsrService/WakeService/TtsService** — leaves holding `listener`/`engine`/
+  `player` + their leaf ops. Each has a per-service `asyncio.Lock` (H5) so
+  concurrent RPCs cannot tear check-then-set state. Services hold NO
+  references to each other — the facade is the only combiner, which keeps
+  test patches on `daemon.speak`/`daemon.start_listening` landing on the
+  real facade path (93 tests stayed green with zero test edits).
+- **EventBus** (R3) — subscriber fan-out + an out-of-band ASR-final handler
+  registry. The auto-listen handshake registers a token before its
+  `wait_for`; `publish` invokes the registered handler synchronously, so a
+  slow TTS subscriber's drop-oldest cannot eat the handshake `final` frame.
+  Per-handshake tokens (not a single slot) prevent a second wake from
+  overwriting/clobbering the first's handler.
+- **Facade** (`server.py`) — owns `config`, `audio_lane`, lifecycle
+  (`start`/`stop`/`run_forever`/`build_app`/`probe_audio_lane`), and
+  orchestration (`speak` wraps wake pause/resume + ASR stop/resume around
+  `TtsService._play`; `_on_wake` runs the auto-listen handshake). rw
+  properties (`daemon._listener`, `.listening`, `._wake`, `.wake_armed`,
+  `.hotwords`, `.speaking`, `._player`) delegate to the services so existing
+  tests reading/assigning facade fields keep working.
 
 ## 4. Inference Delegation (fusion-mlx boundary)
 
@@ -90,6 +153,9 @@ audio endpoints and nothing else:
 - M1 bridge: `transcribe_stream(config, audio_bytes, *, filename, language, model)` —
   multipart POST, returns the parsed dict, raises `AudioBridgeError(status=...)` on
   non-200. M2 makes this chunked (VAD-segmented audio, post when a segment closes).
+  E3: a 200 with a non-JSON/malformed body (a transient mid-load hiccup) is retried
+  and, on final failure, raised as `AudioBridgeError("transcribe: malformed response
+  (status N): ...", status=N)` carrying the status — never a bare `JSONDecodeError`.
 - **Upstream fix required (M1, issue #649):** fusion-mlx `_is_hf_cache_mlx_compatible`
   rejected HF-format audio repos — `openai/whisper-tiny` ships HF `model.safetensors`
   (metadata `format:pt`, not `mlx`) + a full tokenizer, and its repo name carries no
@@ -107,7 +173,10 @@ audio endpoints and nothing else:
 - M1 bridge: `synthesize_stream(config, text, *, voice, model, stream, streaming_interval)`
   — async generator yielding WAV header then PCM chunks; parses sample_rate from the
   header. `synthesize_full` collects all chunks into one `bytes`. M4 wires the
-  generator straight to the speaker.
+  generator straight to the speaker. E3: a 200 whose first chunk is not a valid
+  RIFF/WAVE (sample_rate parses to 0) aborts the stream with
+  `AudioBridgeError("synthesize: malformed WAV (sample_rate=0)", status=200)` rather
+  than silently piping zero-rate PCM that plays as garbage or hangs the player.
 - **Verified real-load (M1):** `speech.synthesize` over UDS JSON-RPC → fusion-mlx
   Qwen3-TTS, 388 KB 16-bit mono 24 kHz WAV in 5.3 s.
 
@@ -149,7 +218,7 @@ params are normalized to dict. Handler exceptions map to `-32000` via
 | Method | Params | Result |
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp: <float>}` |
-| `speech.status` | `{}` | `{running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords}` |
+| `speech.status` | `{}` | `{running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords, speaking, restart_count, last_wake_word, metrics}` |
 | `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
 | `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
@@ -157,6 +226,9 @@ params are normalized to dict. Handler exceptions map to `-32000` via
 | `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
 | `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` — register wake words (pretrained only) |
 | `speech.wake` | `{arm: bool}` | `{armed: bool, words: [...]}` — arm/disarm wake |
+| `speech.speak` | `{text, voice?, model?}` | `{played, chars, sample_rate}` — stream TTS to speaker (pauses mic) |
+| `speech.stop_tts` | `{}` | `{stopped}` — cancel active playback |
+| `speech.reprobe` | `{}` | `{audio_lane}` — re-probe fusion-mlx audio lane (E1, additive non-breaking) |
 
 Model resolution: when `model` is omitted, the daemon uses the configured default
 (`FUSION_SPEECH_STT_MODEL` / `FUSION_SPEECH_TTS_MODEL`); if that id is not in the
@@ -164,15 +236,28 @@ probed fusion-mlx set, it falls back to the first probed audio model of that
 modality (WARNING-logged). This makes `speech.synthesize {}` work out-of-box even
 when fusion-mlx's loaded model differs from the configured default.
 
-**Notifications (M2/M3, implemented).** The daemon pushes `speech.asr` and
-`speech.wake` events to connected WebSocket subscribers on `/stream/stt` (not
-over UDS — WS is the realtime push channel; UDS stays request/response).
-Notification frames carry no `id`; clients must not reply. `speech.asr` states:
-`listening` (capture armed), `speaking` (VAD onset), `transcribing` (segment
-posted to fusion-mlx), `final` (transcript + `text`/`language`/`duration`, or
-`skipped:true` for sub-0.1s segments), `error`. `speech.wake` carries `{word,
-ts}` and is immediately followed by the auto-started `speech.asr` frames. A
-`keepalive` frame is sent after 30s idle so proxies do not close the socket.
+**Notifications (M2/M3/M4, implemented).** The daemon pushes `speech.asr`,
+`speech.wake`, and `speech.tts` events to connected WebSocket subscribers on
+`/stream/stt` (not over UDS — WS is the realtime push channel; UDS stays
+request/response). Notification frames carry no `id`; clients must not reply.
+- `speech.asr` states: `listening` (capture armed), `speaking` (VAD onset),
+  `transcribing` (segment posted to fusion-mlx), `final` (transcript +
+  `text`/`language`/`duration`, or `skipped:true` for sub-0.1s segments),
+  `error`.
+- `speech.wake` carries `{word, ts}` and is immediately followed by the
+  auto-started `speech.asr` frames.
+- `speech.tts` states: `starting`/`speaking`/`done`/`cancelled`/`error`
+  (M4). `error` carries `degraded: true` + the resume-failure detail when a
+  `speak` could not cleanly re-arm wake/ASR after playback (R5).
+- `speech.shutdown` is broadcast on graceful stop so WS clients can drain
+  in-flight frames before the socket closes (R6).
+- `speech.restarted` carries `{restart_count, ts}` and is broadcast when the
+  daemon boots and `restart_count > 1` (crash recovery or deliberate restart,
+  E6).
+- `speech.keepalive` (H2) is a distinct event type sent after `ws_keepalive_s`
+  idle so proxies do not close the socket. It is NOT a disguised `speech.asr`
+  frame — clients filtering `speech.asr` for real ASR state do not sift
+  keepalive noise.
 
 **Methods (M4, implemented).**
 
@@ -218,10 +303,12 @@ sounddevice (16kHz mono) ─▶ ring_buffer ─▶ VAD ─▶ stt_stream ─▶ 
   notification via `run_coroutine_threadsafe` (the VAD runs on the drain task).
 
 **Push channel.** `speech.asr` frames go to WebSocket `/stream/stt` subscribers
-(FastAPI), not over UDS. `SpeechDaemon.subscribe()` returns a per-client
-`asyncio.Queue`; `broadcast()` fans out with drop-oldest on `QueueFull` (a slow
-client must never stall the capture pipeline). The WS handler reads its queue
-with a 30s timeout, sending `keepalive` on idle.
+(FastAPI), not over UDS. `EventBus.subscribe()` returns a per-client
+`asyncio.Queue` (maxsize from `FUSION_SPEECH_WS_SUBSCRIBER_QUEUE`, default 64);
+`publish()` fans out with drop-oldest on `QueueFull` (a slow client must never
+stall the capture pipeline). The WS handler reads its queue with a
+`ws_keepalive_s` timeout (default 30s), sending `speech.keepalive` on idle (H2:
+a distinct event type, not a disguised `speech.asr` frame).
 
 **Backpressure.** The ring buffer drops oldest on overflow (realtime capture
 must never block); overrun counters are tracked on the ring. The subscriber
@@ -245,10 +332,17 @@ sounddevice (16kHz mono) ─▶ ring_buffer ─▶ wake_word (80ms frames) ─�
     own `download_models()` has no URL-override hook, so we roll our own.
   - `WakeWordEngine(config, *, on_wake, audio_source=None)` — the streaming
     detector. Reuses `audio_source.ring` if passed (shared mic with an active
-    listener), else builds its own RingBuffer + AudioSource. Drain task reads
-    1280-sample (80ms @ 16k) frames — openwakeword's native chunk size — and calls
-    `openwakeword.Model.predict`. `Model` is built with `inference_framework="onnx"`
-    and `melspec_model_path`/`embedding_model_path` pointed at the cache dir, so all
+    listener), else builds its own RingBuffer + AudioSource. Drain task reads a
+    **fixed** 1280-sample (80ms @ 16k) frame — openwakeword's native chunk size —
+    and calls `openwakeword.Model.predict`. R7: the read is fixed at
+    `wake_chunk_samples` (default 1280), not `available - (available % 1280)` —
+    a variable-length read (2560/3840…) corrupts the model's 80ms-frame score
+    contract. Leftover samples stay in the ring for the next pass (no loss). The
+    predict runs off the event loop via `run_in_executor` (R1) so a blocking ONNX
+    call does not starve ASR-final/WS writes; the single drain task serializes
+    frames so the non-thread-safe ONNX session sees no concurrent access.
+    `Model` is built with `inference_framework="onnx"` and
+    `melspec_model_path`/`embedding_model_path` pointed at the cache dir, so all
     three ONNX files load from our cache (no reliance on package resources, which
     ship empty). A score ≥ `wake_threshold` (default 0.5) fires `on_wake(word)`
     ONCE, then a `wake_debounce_s` cooldown blocks repeats (one utterance = one
@@ -258,12 +352,16 @@ sounddevice (16kHz mono) ─▶ ring_buffer ─▶ wake_word (80ms frames) ─�
   `Model` construction raises, `enabled=False` and the engine is a no-op.
   `arm_wake()` returns `{armed: false}`; the daemon keeps running. Never fatal.
 - **Coexistence (chosen model)** — wake paused during ASR + auto-listen on wake.
-  On `_on_wake`: broadcast `speech.wake` → `wake.pause()` → `start_listening()`
-  (reusing wake's mic source if wake owns it) → sleep `wake_auto_listen_s`
-  (default 8s) → `stop_listening()` → `wake.resume()`. The pause is critical:
-  while paused the drain does NOT read the ring, so the ASR listener is the sole
-  SPSC consumer (no read race). If ASR is already active when wake fires, the
-  handshake is skipped (already listening).
+  On `_on_wake` (serialized by `_handshake_lock`, H5): broadcast `speech.wake` →
+  `wake.pause()` → `start_listening()` (reusing wake's mic source if wake owns
+  it) → wait on a per-handshake `asyncio.Event` bounded by `wake_auto_listen_s`
+  (default 8s) → `stop_listening()` → `wake.resume()`. The window ends early on
+  an ASR `final` frame (delivered out-of-band via EventBus's handler registry,
+  R3, so a slow TTS subscriber cannot drop it) plus a `wake_debounce_s` silence
+  guard — no fixed dead-wait. The pause is critical: while paused the drain does
+  NOT read the ring, so the ASR listener is the sole SPSC consumer (no read
+  race). If ASR is already active when wake fires, the handshake is skipped
+  (already listening).
 - **set_hotwords** — `WakeWordEngine.set_hotwords(words)` swaps the active wake
   words at runtime. Only pretrained names (`alexa`, `hey_mycroft`, `hey_jarvis`,
   `hey_rhasspy`, `timer`, `weather`) are usable; unknown names are logged + dropped.
@@ -300,6 +398,10 @@ time-to-first-audio is bound by the first PCM chunk, not the full synthesis.
 - **Mic guard.** While speaking, wake is paused; if ASR was listening, it is
   stopped then restarted after playback ends — no self-trigger, no echo. Reuses
   the M2/M3 primitives (`wake.pause()`, `stop_listening()`/`start_listening()`).
+  R5: if the resume (`wake.resume`/`start_listening`) fails, the facade no
+  longer swallows it silently — it broadcasts a `speech.tts error` event with
+  `degraded: true` and latches `TtsService.degraded` so clients know the
+  pipeline needs re-arm; a clean resume clears the flag.
 - **Events.** `speech.tts` notifications (`starting`/`speaking`/`done`/`cancelled`/`error`)
   flow on the existing `/stream/stt` WebSocket — not a separate endpoint, and
   there is no stream id (one active playback at a time).
@@ -313,26 +415,43 @@ No config file — environment only. `SpeechConfig` (dataclass) reads env at
 construction in `config.py`; `load_config()` materializes it, makes the log dir,
 and logs the resolved values.
 
+**Validation (E4).** `SpeechConfig.__post_init__` fail-loud-raises `ValueError`
+on invalid values rather than silently running a broken pipeline:
+- `sample_rate` must be 16000 — hard-pinned by the VAD/wake/openwakeword
+  contract (each model is trained on 16 kHz mono). Setting
+  `FUSION_SPEECH_SAMPLE_RATE` to anything else makes startup fail loudly
+  instead of producing garbage probabilities.
+- `channels` must be 1 (mono pipeline).
+- `0 < wake_threshold <= 1`, `wake_auto_listen_s > 0`, `wake_debounce_s >= 0`,
+  `0 < vad_speech_threshold < 1`, `0 < tts_playback_buffer_s <= 10`,
+  `chunk_ms > 0`, `0 <= port <= 65535` (0 = ephemeral OS bind, used by tests),
+  `wake_chunk_samples` must be 1280 (openwakeword frame contract),
+  `ws_keepalive_s > 0`, `ws_subscriber_queue > 0`, `probe_interval_s > 0`.
+
 Key fields: `port`, `socket_path`, `sample_rate`, `stt_model`, `tts_model`,
 `tts_voice`, `language`, `mlx_base_url`, `mlx_api_key`, `vad_speech_threshold`,
-`chunk_ms`, `log_level`, `log_dir`. See README for the env-var table.
+`chunk_ms`, `wake_chunk_samples`, `ws_keepalive_s`, `ws_subscriber_queue`,
+`probe_interval_s`, `log_level`, `log_dir`. See README for the env-var table.
 
-**Runtime state** lives on `SpeechDaemon`:
-- `running`, `start_time` — lifecycle + uptime.
-- `audio_lane` — `{tts, stt, probed, error}` from the startup probe.
-- `listening` — mic capture armed (M2).
-- `hotwords` — registered wake phrases (M3).
-- `wake_armed` — wake detection armed (M3).
-- `speaking` — TTS playback active (M4).
-- `_wake` — the active `WakeWordEngine`, lazily built on `speech.wake {arm:true}`,
-  torn down on disarm/daemon stop.
-- `_listener` — the active `StreamingListener`, lazily built on
-  `speech.start_listening`, torn down on stop/daemon stop.
-- `_player` — the active `StreamingPlayer`, lazily built on `speech.speak`,
-  torn down on stop/daemon stop (M4).
-- `_subscribers` — set of per-WS-client `asyncio.Queue` for `/stream/stt`
-  fan-out; `subscribe`/`unsubscribe`/`broadcast` manage it.
-- `_server`, `_app`, `_http_task` — owned asyncio/uvicorn handles.
+**Persistent state (E6).** `DaemonState` (`state.py`) persists
+`~/.fusion-speech/run/state.json`: `start_time`, `restart_count`,
+`last_wake_word`, `uptime_at_stop`. `start()` bumps `restart_count`
+(`enter_start`) and, if count > 1, broadcasts `speech.restarted` so clients
+learn the daemon was rebooted (crash recovery). `stop()` records
+`uptime_at_stop` (`enter_stop`). A crash (no `stop()`) leaves the file in
+place; the next boot's `enter_start` still increments, so `restart_count`
+reflects reboots regardless of clean vs crash.
+
+**Runtime state** lives on the leaf services + facade (Wave 2):
+- Facade: `running`, `start_time`, `audio_lane`, `socket_path`, `port`,
+  `_handshake_lock`, `_wake_listen_done`/`_last_final_ts` (handshake), `state`,
+  `_restart_count`, `_probe_task`.
+- `AsrService`: `listener`, `listening`.
+- `WakeService`: `engine`, `armed`, `hotwords`.
+- `TtsService`: `player`, `speaking`, `degraded` (R5).
+- `EventBus`: `_subscribers` set, ASR-final handler registry.
+- `AudioBus`: the shared `AudioSource` (sole mic owner, H3).
+- `_server`, `_app`, `_http_task` — owned asyncio/uvicorn handles (facade).
 
 Socket dir default `~/.fusion-speech/run` (0o700); socket file 0o600. Log dir
 default `~/.fusion-speech/logs`. Both overridable via env.
@@ -396,6 +515,17 @@ after merge.
   ASR), `speech.tts` events (starting/speaking/done/cancelled/error) on
   `/stream/stt`. Verified: 83 tests green incl. real-load (Kokoro via fusion-mlx,
   fake output, headless).
+- **M4-hardening** — architecture audit remediation (5 waves, 20 findings).
+  **done** — fixes the structural blockers to production commercial release
+  identified in `audit/fusion-speech-audit-report-0827.md`. Wave 2 split the
+  `SpeechDaemon` god-object into 5 leaf services + a thin facade (§3a); Wave 3
+  added per-service locks + a per-handshake ASR-final registry (H5/R3/R4); Wave 4
+  added zero-dependency `/metrics`, bounded shutdown drain, 15s start.sh grace,
+  and persistent restart state (E2/R6/E8/E6); Wave 5 added config validation,
+  self-healing re-probe, malformed-200 errors, resume-failure surfacing,
+  separated keepalive event type, and a fixed 1280 wake frame (E4/E1/E3/R5/H2/R7/E5).
+  See README Hardening for the finding-by-finding summary. Verified: 147 tests
+  green, ruff clean.
 - **M5** — fusion-studio integration: SpeechBridge.swift, mic permission,
   port-registry `11465`. Upstream issue → PR.
 - **M6** — tests, integration (real fusion-mlx start/stop), final docs.
