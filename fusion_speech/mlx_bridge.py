@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import struct
 from collections.abc import AsyncIterator
@@ -96,6 +97,38 @@ def _extract_error(resp: httpx.Response) -> str:
         return f"HTTP {resp.status_code}"
 
 
+_RETRY_BACKOFFS = (0.5, 1.0, 2.0)  # audit M1: retry transient mlx failures
+
+
+def _retryable(exc: BaseException) -> bool:
+    # Retry 5xx (encoded in AudioBridgeError.status), transport/timeout errors,
+    # and JSONDecodeError (a 200 with a malformed/empty body is often a
+    # transient mid-load hiccup from fusion-mlx). Never retry 4xx (client
+    # error — model id, bad request).
+    if isinstance(exc, (httpx.TransportError, httpx.TimeoutException, json.JSONDecodeError)):
+        return True
+    status = getattr(exc, "status", 0)
+    return 500 <= status < 600
+
+
+async def _with_retry(label: str, fn):
+    # fn() -> awaitable; returns its result. Retries up to len(_RETRY_BACKOFFS)
+    # times on _retryable errors, backing off between attempts.
+    last_exc: BaseException | None = None
+    for attempt in range(len(_RETRY_BACKOFFS) + 1):
+        try:
+            return await fn()
+        except Exception as e:
+            last_exc = e
+            if not _retryable(e) or attempt == len(_RETRY_BACKOFFS):
+                raise
+            delay = _RETRY_BACKOFFS[attempt]
+            logger.warning("%s attempt %d failed (%r), retry in %.1fs", label, attempt + 1, e, delay)
+            await asyncio.sleep(delay)
+    assert last_exc is not None
+    raise last_exc
+
+
 async def transcribe_stream(
     config,
     audio_bytes: bytes,
@@ -113,12 +146,27 @@ async def transcribe_stream(
         if lang:
             data["language"] = lang
         logger.info("transcribe: model=%s lang=%s bytes=%d", stt_model, lang, len(audio_bytes))
-        resp = await client.client.post(_STT_PATH, files=files, data=data)
-        if resp.status_code != 200:
-            msg = _extract_error(resp)
-            logger.warning("transcribe failed: %d %s", resp.status_code, msg)
-            raise AudioBridgeError(f"transcribe failed: {msg}", status=resp.status_code)
-        payload = resp.json()
+
+        async def _post():
+            r = await client.client.post(_STT_PATH, files=files, data=data)
+            if r.status_code != 200:
+                msg = _extract_error(r)
+                logger.warning("transcribe failed: %d %s", r.status_code, msg)
+                raise AudioBridgeError(f"transcribe failed: {msg}", status=r.status_code)
+            return r
+
+        resp = await _with_retry("transcribe", _post)
+        # E3: a 200 with a non-JSON / malformed body is a silent failure —
+        # resp.json() raises a bare JSONDecodeError with no status context.
+        # Wrap so the client sees an explicit AudioBridgeError carrying status.
+        try:
+            payload = resp.json()
+        except (json.JSONDecodeError, ValueError) as e:
+            logger.warning("transcribe: malformed response (status %d): %s", resp.status_code, e)
+            raise AudioBridgeError(
+                f"transcribe: malformed response (status {resp.status_code}): {e}",
+                status=resp.status_code,
+            ) from e
         logger.info("transcribe ok: text=%r", payload.get("text", "")[:80])
         return payload
     finally:
@@ -149,15 +197,27 @@ async def synthesize_stream(
         if stream and streaming_interval is not None:
             body["streaming_interval"] = streaming_interval
         logger.info("synthesize: model=%s voice=%s stream=%s chars=%d", tts_model, tts_voice, stream, len(text))
-        async with client.client.stream("POST", _TTS_PATH, json=body) as resp:
-            if resp.status_code != 200:
-                raw = await resp.aread()
-                msg = _extract_error(httpx.Response(resp.status_code, content=raw))
-                logger.warning("synthesize failed: %d %s", resp.status_code, msg)
-                raise AudioBridgeError(f"synthesize failed: {msg}", status=resp.status_code)
+        # Retry only the initial connection; once bytes start flowing, errors
+        # propagate (re-playing mid-stream audio would duplicate playback).
+        resp_cm = None
+        opened = None
+
+        async def _open():
+            cm = client.client.stream("POST", _TTS_PATH, json=body)
+            r = await cm.__aenter__()
+            if r.status_code != 200:
+                raw = await r.aread()
+                msg = _extract_error(httpx.Response(r.status_code, content=raw))
+                logger.warning("synthesize failed: %d %s", r.status_code, msg)
+                await cm.__aexit__(None, None, None)
+                raise AudioBridgeError(f"synthesize failed: {msg}", status=r.status_code)
+            return cm, r
+
+        resp_cm, opened = await _with_retry("synthesize.connect", _open)
+        try:
             header_sent = False
             sample_rate = 0
-            async for chunk in resp.aiter_bytes():
+            async for chunk in opened.aiter_bytes():
                 if not chunk:
                     continue
                 if not header_sent:
@@ -167,8 +227,17 @@ async def synthesize_stream(
                         sample_rate = _parse_wav_sample_rate(chunk[:_WAV_HEADER_LEN])
                         logger.info("synthesize stream started: sample_rate=%d", sample_rate)
                     header_sent = True
+                    # E3: sample_rate=0 means the WAV header was malformed (not
+                    # a real RIFF/WAVE, or a truncated/empty body returned with
+                    # 200). Fail loud rather than silently streaming zero-rate
+                    # PCM that plays as garbage or hangs the player.
+                    if sample_rate == 0:
+                        logger.warning("synthesize: malformed WAV (sample_rate=0), aborting stream")
+                        raise AudioBridgeError("synthesize: malformed WAV (sample_rate=0)", status=200)
                 yield chunk
-        logger.info("synthesize stream complete")
+            logger.info("synthesize stream complete")
+        finally:
+            await resp_cm.__aexit__(None, None, None)
     finally:
         await client.close()
 

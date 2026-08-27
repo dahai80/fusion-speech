@@ -15,7 +15,6 @@ from fusion_speech.ring_buffer import RingBuffer
 logger = logging.getLogger(__name__)
 
 _RING_CAPACITY = 16000 * 5  # 5s @ 16k, drop-oldest on overrun
-_CHUNK_16K = 1280  # 80ms @ 16k — openwakeword native frame size
 
 # pretrained openwakeword wake words shipped as release assets (name -> model file).
 # All available at <release_base>/<name>_v0.1.onnx. Source: openwakeword.MODELS.
@@ -147,9 +146,17 @@ class WakeWordEngine:
         self._downloader = downloader or WakeModelDownloader
         self.words: list[str] = [config.wake_default_word]
         self.model = None
-        self.enabled = False
+        # R2: model load (and the 120s httpx download it triggers) is deferred
+        # out of __init__ to async load(); enabled stays None (undecided) until
+        # then, so constructing the engine never blocks the event loop.
+        self.enabled = None
         self.threshold = config.wake_threshold
         self._debounce_s = config.wake_debounce_s
+        # R7: openwakeword Model.predict contracts a fixed 1280-sample (80ms)
+        # frame. Read exactly self._chunk per drain pass; leftover stays in the
+        # ring for next pass. Variable-length reads (available % chunk) fed the
+        # model 2560/3840-sample frames and silently corrupted wake scores.
+        self._chunk = config.wake_chunk_samples
         self._cooldown_until: float = 0.0
         self._paused = False
         self._active = False
@@ -157,12 +164,31 @@ class WakeWordEngine:
         self._wake_tasks: set = set()
         self._last_scores: dict[str, float] = {}
         self._fires = 0
+        self._score_keys: dict[str, str] = {}
+
+    async def load(self) -> None:
+        # R2: load the model (and download wake ONNX on first arm) off the event
+        # loop. Idempotent: a no-op once enabled is decided. Fail-soft: on
+        # failure the engine stays disabled (enabled=False), daemon unharmed.
+        if self.enabled is not None:
+            return
         try:
-            self._load_model()
+            loop = asyncio.get_event_loop()
+            await loop.run_in_executor(None, self._load_model)
+            self._score_keys = self._resolve_score_keys()
+            logger.info("wake score keys resolved: %s", self._score_keys)
         except Exception as e:
             logger.warning("wake engine unavailable, disabled: %s", e)
             self.model = None
             self.enabled = False
+
+    async def _reload(self) -> None:
+        # R2: rebuild the model off the event loop (set_hotwords swap). The
+        # download/rebuild is sync and long; run it in an executor so the loop
+        # is not blocked. _load_model sets self.enabled on success.
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(None, self._load_model)
+        self._score_keys = self._resolve_score_keys()
 
     def _load_model(self) -> None:
         if self._model_builder is not None:
@@ -199,9 +225,11 @@ class WakeWordEngine:
     def own_source(self) -> bool:
         return self._own_source
 
-    def set_hotwords(self, words: list[str]) -> list[str]:
+    async def set_hotwords(self, words: list[str]) -> list[str]:
         # Swap the active wake words at runtime. Only pretrained names are usable;
-        # unknown words are dropped (logged). Rebuilds the openwakeword Model.
+        # unknown words are dropped (logged). Rebuilds the openwakeword Model off
+        # the event loop (R2 _reload). On reload failure roll back to the previous
+        # model/words/enabled rather than silently half-disabling the engine (A4).
         known = [w for w in words if w in PRETRAINED_WAKE_WORDS]
         dropped = [w for w in words if w not in PRETRAINED_WAKE_WORDS]
         if dropped:
@@ -209,14 +237,23 @@ class WakeWordEngine:
         if not known:
             logger.warning("set_hotwords: no known words, keep current %s", self.words)
             return list(self.words)
+        prev_words = self.words
+        prev_model = self.model
+        prev_enabled = self.enabled
+        prev_keys = self._score_keys
         self.words = known
         if self.enabled and self._model_builder is None:
             try:
-                self._load_model()
+                await self._reload()
             except Exception as e:
-                logger.warning("set_hotwords reload failed, wake disabled: %s", e)
-                self.model = None
-                self.enabled = False
+                logger.error("set_hotwords reload failed, rolling back: %s", e)
+                self.words = prev_words
+                self.model = prev_model
+                self.enabled = prev_enabled
+                self._score_keys = prev_keys
+                raise WakeModelError(f"set_hotwords reload failed: {e}") from e
+        else:
+            self._score_keys = self._resolve_score_keys()
         return list(self.words)
 
     def pause(self) -> None:
@@ -236,6 +273,10 @@ class WakeWordEngine:
         if self._active:
             logger.warning("wake engine already active")
             return {"armed": True, "already": True}
+        if self.enabled is None:
+            # R2: lazy load on first start (download off the event loop). Fail-soft:
+            # a load failure sets enabled=False -> armed stays False below.
+            await self.load()
         if not self.enabled or self.model is None:
             logger.warning("wake engine not enabled, start is a no-op")
             return {"armed": False, "enabled": False}
@@ -283,40 +324,56 @@ class WakeWordEngine:
                     await asyncio.sleep(0.02)
                     continue
                 available = self.ring.available()
-                if available < _CHUNK_16K:
+                if available < self._chunk:
                     await asyncio.sleep(0.02)
                     continue
-                chunk = self.ring.read(available - (available % _CHUNK_16K))
+                chunk = self.ring.read(self._chunk)
                 if chunk.size == 0:
                     await asyncio.sleep(0.02)
                     continue
-                self._predict(chunk)
+                await self._predict(chunk)
         except asyncio.CancelledError:
             raise
 
-    def _predict(self, chunk: np.ndarray) -> None:
+    async def _predict(self, chunk: np.ndarray) -> None:
+        # R1: ONNX model.predict blocks the event loop (~5-15ms/frame). Run the
+        # pure-sync predict+score in an executor thread so other coroutines (ASR
+        # final push, WS write) are not starved. openwakeword Model.predict is
+        # not thread-safe (internal ONNX session state), but the drain task is a
+        # single serial awaiter — only one frame is in flight at a time, so the
+        # default thread pool never contends on the session.
         if self.model is None:
             return
+        loop = asyncio.get_event_loop()
+        fired_word = await loop.run_in_executor(None, self._predict_sync, chunk)
+        if fired_word is not None:
+            self._fire_callback(fired_word)
+
+    def _predict_sync(self, chunk: np.ndarray) -> str | None:
+        # Pure sync: predict + threshold/cooldown logic. Returns the word that
+        # fired (or None). Runs in an executor off the event loop.
+        if self.model is None:
+            return None
         try:
             scores = self.model.predict(chunk)
         except Exception:
             logger.exception("wake predict failed")
-            return
+            return None
         if not isinstance(scores, dict):
-            return
+            return None
         self._last_scores = scores
         now = time.monotonic()
         if now < self._cooldown_until:
-            return
+            return None
         for word in self.words:
-            key = self._score_key(word)
+            key = self._score_keys.get(word, self._fallback_score_key(word))
             score = float(scores.get(key, 0.0))
             if score >= self.threshold:
                 self._fires += 1
                 self._cooldown_until = now + self._debounce_s
                 logger.info("wake fired word=%s score=%.3f", word, score)
-                self._fire_callback(word)
-                return
+                return word
+        return None
 
     def _fire_callback(self, word: str) -> None:
         if self._on_wake is None:
@@ -339,8 +396,36 @@ class WakeWordEngine:
         if exc is not None:
             logger.error("wake on_wake task failed: %r", exc)
 
+    def _resolve_score_keys(self) -> dict[str, str]:
+        # openwakeword.Model.predict() keys its score dict by the model name it
+        # derives internally as splitext(basename(path))[0] — e.g. file
+        # "hey_jarvis_v0.1.onnx" -> key "hey_jarvis_v0.1". Older code wrongly did
+        # splitext("hey_jarvis_v0.1")[0] -> "hey_jarvis_v0" (stripped the ".1"),
+        # so scores never matched and wake never fired. Read the real keys from
+        # the model's class_mapping / models attrs; fall back to the same
+        # derivation openwakeword uses if those attrs are absent.
+        if self.model is None:
+            return {}
+        real_keys: list[str] = []
+        class_mapping = getattr(self.model, "class_mapping", None)
+        if isinstance(class_mapping, dict):
+            real_keys = [str(k) for k in class_mapping]
+        if not real_keys:
+            models = getattr(self.model, "models", None)
+            if isinstance(models, dict):
+                real_keys = [str(k) for k in models]
+        result: dict[str, str] = {}
+        for word in self.words:
+            if not real_keys:
+                result[word] = self._fallback_score_key(word)
+                continue
+            model_file = PRETRAINED_WAKE_WORDS.get(word, word)
+            match = next((k for k in real_keys if k == model_file or k.startswith(model_file)), None)
+            result[word] = match if match is not None else self._fallback_score_key(word)
+        return result
+
     @staticmethod
-    def _score_key(word: str) -> str:
-        # openwakeword model name == basename without extension (e.g. hey_jarvis_v0.1)
+    def _fallback_score_key(word: str) -> str:
+        # mirror openwakeword's own derivation: splitext(basename(path))[0]
         model_file = PRETRAINED_WAKE_WORDS.get(word, word)
-        return os.path.splitext(model_file)[0]
+        return os.path.splitext(os.path.basename(model_file + ".onnx"))[0]

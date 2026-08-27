@@ -99,12 +99,18 @@ class AudioSource:
         )
 
     def _on_audio(self, indata: np.ndarray, frames: int, time_info, status) -> None:
-        # PortAudio callback: realtime thread. Never block/await here.
+        # PortAudio callback: realtime thread. Never block/await/allocate here.
+        # Selects channel 0 (left) for multi-channel input — a view, no copy
+        # (the old np.ascontiguousarray allocated per frame; audit A2). Mono
+        # (channels==1) reshapes to 1-D, also a view. ring.write's slice
+        # assignment handles a non-contiguous source without needing a copy.
         if status:
             self._xruns += 1
-            logger.warning("audio callback status=%s xruns=%d", status, self._xruns)
+            # no logger call in the realtime callback; surfaced in stop()
         mono = indata[:, 0] if self.channels > 1 and indata.ndim > 1 else indata.reshape(-1)
-        self.ring.write(np.ascontiguousarray(mono, dtype=np.float32))
+        if mono.dtype != np.float32:
+            mono = mono.astype(np.float32)
+        self.ring.write(mono)
 
     def stop(self) -> None:
         stream = self._stream
@@ -119,5 +125,18 @@ class AudioSource:
             stream.close()
         except Exception:
             logger.exception("audio stream close failed")
-        logger.info("audio source stopped: xruns=%d", self._xruns)
+        # P2-1: ring overruns are surfaced here (asyncio-side teardown), not
+        # in the realtime write() path where they happen. xruns come from the
+        # PortAudio callback status; ring overruns from ring.write drop-oldest.
+        ring_overruns = self.ring.overruns
+        ring_dropped = self.ring.total_dropped
+        logger.info(
+            "audio source stopped: xruns=%d ring_overruns=%d dropped=%d",
+            self._xruns,
+            ring_overruns,
+            ring_dropped,
+        )
+        # Only the owning engine calls stop() (a sharing ASR listener never
+        # calls it on a borrowed source), so closing the ring here is safe and
+        # does not tear down a shared wake ring (audit A3).
         self.ring.close()

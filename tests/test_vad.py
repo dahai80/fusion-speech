@@ -142,7 +142,7 @@ def test_reset_clears_state():
     assert eng._in_speech is True
     eng.reset()
     assert eng._in_speech is False
-    assert eng._buffer.size == 0
+    assert eng._len == 0
     assert model.resets >= 2
 
 

@@ -74,8 +74,8 @@ def _patch_daemon_for_wake(daemon, *, auto_listen_s=0.2):
     async def fake_arm():
         wake = build_engine()
         daemon._wake = wake
-        if not wake.enabled:
-            return {"armed": False, "enabled": False}
+        # R2: enabled is None at construction; start() loads on demand (the
+        # injected _FakeOwwModel builder makes load instant). No pre-start guard.
         res = await wake.start()
         daemon.wake_armed = bool(res.get("armed"))
         if daemon.wake_armed:
