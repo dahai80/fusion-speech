@@ -39,6 +39,9 @@ include = ["fusion_speech*"]
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
 testpaths = ["tests"]
+markers = [
+    "real_load: starts the real daemon + real fusion-mlx (slow, opt-in via FUSION_SPEECH_REAL_LOAD=1)",
+]
 
 [tool.coverage.run]
 source = ["fusion_speech"]

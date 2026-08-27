@@ -208,6 +208,46 @@ curl http://127.0.0.1:11465/metrics
 Only this project's directory is modified. Upstream fusion-mlx / fusion-studio /
 port-registry changes go through issue first, then PR.
 
+## Testing
+
+Unit + adversarial gate suite run offline (no model load, no live daemon):
+
+```bash
+cd /Users/dahai/fusion && source .venv/bin/activate
+cd fusion-speech
+FUSION_MLX_API_KEY=dahai168 pytest tests/ -q          # 148 passed, 5 skipped
+ruff check fusion_speech tests                         # clean
+```
+
+The 5 skipped tests carry the `real_load` marker — they start the real
+fusion-speech daemon (real port 11465 + real socket) backed by a real
+fusion-mlx on 11434, so they are opt-in. Set `FUSION_SPEECH_REAL_LOAD=1`
+(and have fusion-mlx up) to run them:
+
+```bash
+~/claude-home/fusion-mlx/start.sh start
+FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=dahai168 \
+  pytest tests/test_m6_real_load_integration.py -m real_load -v
+```
+
+The real-load suite is a 5-step full-chain gate over UDS JSON-RPC:
+
+1. `speech.ping`/`speech.status` — liveness + audio-lane probed.
+2. `speech.transcribe` — real STT over fusion-mlx against the bundled
+   English fixture. **Skipped on upstream fusion-mlx STT 500** (issue #668:
+   `mlx-audio` Whisper `non_speech_tokens` `IndexError` makes
+   `/v1/audio/transcriptions` return 500 for every model). Turns into a
+   real assertion the moment #668 lands a fix; the RPC path itself is
+   verified correct.
+3. `speech.synthesize` — real TTS, asserts non-empty WAV (`RIFF` + PCM body).
+4. `speech.speak` — streaming playback, polls `speech.status` until settled.
+5. `speech.wake` — arm/disarm over real openwakeword ONNX; headless silence
+   must not fire a spurious wake.
+
+Test fixtures live in `tests/fixtures/` (kept as final artifacts). The UDS
+client helper is `tests/_uds_client.py`; the `real_daemon` session fixture
+(spawn via `start.sh`, real socket/port) is in `tests/conftest.py`.
+
 ## Status
 
 Milestone progress:
@@ -356,6 +396,18 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
     Swift class (UDS JSON-RPC client) + mic permission + `/stream/stt` event
     subscription. Swift implementation is out of this project's scope (upstream
     issue-first → PR per workflow).
-- **M6** — tests, integration, docs (pending)
+- **M6** — tests, integration, docs. **done**
+  - Real-load full-chain integration gate (`tests/test_m6_real_load_integration.py`):
+    5 steps over UDS JSON-RPC — ping/status, transcribe, synthesize, speak,
+    wake arm/disarm — opt-in via the `real_load` marker (see [Testing](#testing)).
+  - UDS client helper `tests/_uds_client.py` (newline-delimited JSON-RPC 2.0,
+    4 MiB readline limit for large base64 payloads). `real_daemon` session
+    fixture in `tests/conftest.py` spawns the real daemon on port 11465 +
+    real socket, stripped of the autouse per-test isolation vars.
+  - Upstream blocker filed: fusion-mlx issue #668 — `mlx-audio` Whisper
+    `non_speech_tokens` `IndexError` makes STT return 500 for every model;
+    step 2 skips (not xfails) so the gate is green upstream-side and flips to
+    a real assertion on the fix. TTS path unaffected.
+  - Verified: 148 tests green, 5 skipped (real_load-gated), ruff clean.
 
 License: Apache-2.0.
