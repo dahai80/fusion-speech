@@ -18,6 +18,11 @@ streaming TTS playback).
   from `/v1/audio/speech`. No model weights loaded in this process.
 - **Realtime layers (M2-M4)**: ring-buffer mic capture, VAD, chunked streaming ASR,
   streaming TTS playback, hotword wake.
+- **Voice sessions (M7)**: WebSocket PCM ingress (`/stream/audio`) as an
+  alternative to the local mic — full-duplex mode keeps VAD live during TTS
+  playback, fires `speech.barge_in` on user interruption, and streams TTS PCM
+  back over the same socket. Pluggable `ASREngine`/`TTSEngine` adapter layer
+  (cloud engines register by name) and a reusable `VoiceSession` state machine.
 - **IPC**: newline-delimited JSON-RPC 2.0 over UDS, with peer-UID verification
   (fail-closed) so only same-user processes can call the daemon.
 
@@ -47,7 +52,7 @@ pip install -e fusion-core
 pip install -e ".[test]"        # from fusion-speech/
 
 # start the inference engine fusion-speech delegates to
-~/claude-home/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh start
 
 # start the speech daemon
 ./start.sh start
@@ -104,6 +109,11 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_WS_SUBSCRIBER_QUEUE` | `64` | per-subscriber push-queue depth (drop-oldest on full) |
 | `FUSION_SPEECH_WAKE_CHUNK_SAMPLES` | `1280` | fixed wake frame size — must be 1280 (openwakeword 80ms contract); non-1280 fails startup |
 | `FUSION_SPEECH_PROBE_INTERVAL_S` | `60.0` | background audio-lane re-probe interval (sec) |
+| `FUSION_SPEECH_WS_INGRESS` | `1` | enable the `/stream/audio` WS PCM ingress endpoint |
+| `FUSION_SPEECH_WS_TOKEN` | (empty) | optional bearer token for `/stream/audio` (`?token=` or `x-fusion-speech-token` header); empty = no auth (port is localhost-only) |
+| `FUSION_SPEECH_WS_MAX_FRAME` | `65536` | max WS audio frame size in bytes (larger frames rejected) |
+| `FUSION_SPEECH_BARGE_IN` | `1` | default barge-in armed for full-duplex sessions |
+| `FUSION_SPEECH_REPROMPT_CONFIDENCE` | `0.0` | ASR finals with confidence below this emit `speech.reprompt` (0 = disabled; empty transcripts always reprompt) |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -164,6 +174,47 @@ out-of-box even when fusion-mlx's loaded model differs from the configured defau
 Error codes follow JSON-RPC 2.0: `-32700` parse error, `-32600` invalid request,
 `-32601` method not found, `-32603` internal error, `-32000` handler error.
 
+## Voice Sessions (WS PCM Ingress)
+
+`/stream/audio` is an alternative audio transport to the local mic: a browser
+(or any client) streams 16 kHz mono PCM over a WebSocket and gets ASR, TTS, and
+session events back on the same socket. The ASR path is the exact mic pipeline
+(ring buffer → VAD → segment → transcribe), so WS-fed audio behaves identically.
+
+Protocol (one connection = one voice session, one ASR stream at a time):
+
+| Client frame | Meaning |
+|---|---|
+| `{"type":"start", "mode":"full_duplex"\|"half_duplex", "encoding":"int16"\|"float32", "tts_sink":"ws"\|"local", "asr_engine":"local", "tts_engine":"local", "barge_in":bool, "reprompt_min_confidence":float, "session":"id"}` | start a session (answers `speech.session.info`) |
+| binary frame | 16 kHz mono PCM (`int16` LE by default, `float32` LE via `encoding`) |
+| `{"type":"speak","text","voice?","model?","ref_audio?","ref_text?"}` | synthesize + play (streams binary PCM back when `tts_sink=ws`) |
+| `{"type":"tts_cancel"}` | cancel playback immediately (drop queued audio) |
+| `{"type":"stop"}` | end the session (or just disconnect) |
+
+Server frames: JSON events (same `speech.*` contract as `/stream/stt`, plus
+`speech.session` state transitions, `speech.barge_in`, `speech.reprompt`,
+`speech.session.error`) and binary int16 PCM while TTS is streaming to the WS.
+
+Full-duplex + barge-in (the point of the mode): the client plays the TTS audio
+and runs AEC, so server-side VAD stays live during playback. When the user
+speaks over the TTS, VAD onset fires `speech.barge_in`, pending audio is
+dropped, playback is cancelled (server-side cancel latency is well under the
+100 ms budget), and the session returns to `listening` while the interrupting
+utterance is transcribed. Half-duplex keeps the mic-era behavior (ASR paused
+during playback).
+
+State machine (importable standalone from `fusion_speech.session.VoiceSession`):
+`listening → speaking → interrupted → listening`, with a low-confidence /
+empty-transcript `speech.reprompt` branch.
+
+Pluggable engines (`fusion_speech.engines`): `ASREngine`
+(`start_stream/feed/finish/cancel`) and `TTSEngine` (`synthesize` WAV stream +
+`cancel`). `"local"` is the fusion-mlx delegation (including `ref_audio`/
+`ref_text` cloning params — forwarded only when set; fusion-mlx does not accept
+them on `/v1/audio/speech` yet, upstream issue dahai80/fusion-mlx#1339). Cloud
+engines (e.g. iFlytek WS) register via `register_asr_engine` /
+`register_tts_engine` and are selected per session by name — no fork needed.
+
 ## Metrics
 
 `GET /metrics` on the HTTP port (`127.0.0.1:11465`) returns Prometheus text
@@ -185,6 +236,8 @@ report state gauges; the ASR/TTS bridges report throughput.
 | `listening` | Gauge | — | 1 when ASR listener active, else 0 |
 | `wake_armed` | Gauge | — | 1 when wake engine armed, else 0 |
 | `speaking` | Gauge | — | 1 when TTS player active, else 0 |
+| `sessions` | Gauge | — | current WS voice sessions |
+| `barge_in_total` | Counter | — | barge-in interruptions (VAD onset during playback) |
 
 `speech.status` also returns a metrics summary (`uptime`, `rpc_total`,
 `errors_total`). Scrape with:
@@ -223,34 +276,36 @@ Unit + adversarial gate suite run offline (no model load, no live daemon):
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 148 passed, 5 skipped
+FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 183 passed, 6 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
-The 5 skipped tests carry the `real_load` marker — they start the real
+The 6 skipped tests carry the `real_load` marker — they start the real
 fusion-speech daemon (real port 11465 + real socket) backed by a real
 fusion-mlx on 11434, so they are opt-in. Set `FUSION_SPEECH_REAL_LOAD=1`
 (and have fusion-mlx up) to run them:
 
 ```bash
-~/claude-home/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh start
 FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=<your-key> \
   pytest tests/test_m6_real_load_integration.py -m real_load -v
 ```
 
-The real-load suite is a 5-step full-chain gate over UDS JSON-RPC:
+The real-load suite is a 6-step full-chain gate:
 
 1. `speech.ping`/`speech.status` — liveness + audio-lane probed.
 2. `speech.transcribe` — real STT over fusion-mlx against the bundled
-   English fixture. **Skipped on upstream fusion-mlx STT 500** (issue #668:
-   `mlx-audio` Whisper `non_speech_tokens` `IndexError` makes
-   `/v1/audio/transcriptions` return 500 for every model). Turns into a
-   real assertion the moment #668 lands a fix; the RPC path itself is
-   verified correct.
+   English fixture (whole-file WAV upload). The upstream fusion-mlx STT 500
+   (issue #668, `mlx-audio` Whisper `non_speech_tokens` `IndexError`) is
+   fixed upstream — this step now asserts real transcription text.
 3. `speech.synthesize` — real TTS, asserts non-empty WAV (`RIFF` + PCM body).
 4. `speech.speak` — streaming playback, polls `speech.status` until settled.
 5. `speech.wake` — arm/disarm over real openwakeword ONNX; headless silence
    must not fire a spurious wake.
+6. `/stream/audio` voice session — full-duplex WS session on the real daemon:
+   silence must not open a segment, WS `speak` streams real Kokoro PCM back
+   as binary frames, mid-stream `tts_cancel` (barge-in path) stops audio,
+   stop releases the listener slot.
 
 Test fixtures live in `tests/fixtures/` (kept as final artifacts). The UDS
 client helper is `tests/_uds_client.py`; the `real_daemon` session fixture
@@ -421,6 +476,29 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
     a real assertion on the fix. TTS path unaffected.
   - Verified: 148 tests green, 5 skipped (real_load-gated), ruff clean.
 
+- **M7** — full-duplex voice sessions (issue #2). **done**
+  - M-A WS PCM ingress: `/stream/audio` — 16 kHz mono PCM (int16 LE default,
+    float32 optional) into the exact mic pipeline (ring → VAD → segment →
+    transcribe); one ASR stream at a time (mic or WS); optional token auth;
+    per-frame size bound.
+  - M-B full-duplex + barge-in: VAD stays live during TTS playback;
+    `speech.barge_in` on VAD onset; sink flush + player cancel land well
+    under the 100 ms server-side budget; half-duplex keeps mic-era behavior.
+    TTS streams back as binary PCM (`tts_sink=ws`) or plays locally.
+  - M-C pluggable engines: `ASREngine` (`start_stream/feed/finish/cancel`) +
+    `TTSEngine` (WAV stream + cancel) with a name registry; `local` = the
+    fusion-mlx bridge (incl. `ref_audio`/`ref_text` cloning forward —
+    upstream gap: fusion-mlx issue #1339); a registered cloud stub passes the
+    same player conformance suite as the local engine.
+  - M-D session state machine: `VoiceSession` (`listening → speaking →
+    interrupted → listening`), barge-in latch + count, empty/low-confidence
+    `speech.reprompt` branch; importable standalone or daemon-wired.
+  - Also: audio-utility models (DeepFilterNet/denoise) excluded from the STT
+    probe classification (they poisoned the model fallback with a 400), and
+    the real-load transcribe step now runs a real assertion (upstream #668
+    fixed).
+  - Verified: 183 tests green + 6 real-load steps green (real STT/TTS/wake
+    + WS session), ruff clean.
 - **0.1.1** — bilingual docs (Chinese `README_CN.md`), scenario-based
   [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) and developer
   [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md); patch over 0.1.0rc1. No runtime

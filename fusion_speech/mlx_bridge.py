@@ -75,6 +75,11 @@ def _filter_audio_models(models: list[dict[str, Any]]) -> tuple[list[str], list[
         if m.get("modality") == "audio" or any(k in low for k in ("whisper", "parakeet", "asr")):
             if any(k in low for k in ("tts", "kokoro", "chatterbox", "vibevoice", "voxcpm", "dia", "kitten")):
                 tts_ids.append(mid)
+            elif any(k in low for k in ("deepfilter", "denoise", "enhance", "separate")):
+                # audio-utility models (denoise/enhancement/source-separation)
+                # are neither STT nor TTS — classifying them as STT poisons the
+                # probe-driven model fallback (400 from fusion-mlx)
+                logger.debug("audio model %r classified as utility (neither stt nor tts)", mid)
             else:
                 stt_ids.append(mid)
     return stt_ids, tts_ids
@@ -181,6 +186,8 @@ async def synthesize_stream(
     model: str = "",
     stream: bool = True,
     streaming_interval: float | None = None,
+    ref_audio: str = "",
+    ref_text: str = "",
 ) -> AsyncIterator[bytes]:
     tts_model = model or config.tts_model
     tts_voice = voice or config.tts_voice
@@ -196,6 +203,13 @@ async def synthesize_stream(
             body["voice"] = tts_voice
         if stream and streaming_interval is not None:
             body["streaming_interval"] = streaming_interval
+        # zero-shot cloning params (issue #2 M-C): forwarded only when set so
+        # backends without cloning support see a clean body. fusion-mlx
+        # /audio/speech does not accept these yet (upstream gap, issue filed).
+        if ref_audio:
+            body["ref_audio"] = ref_audio
+        if ref_text:
+            body["ref_text"] = ref_text
         logger.info("synthesize: model=%s voice=%s stream=%s chars=%d", tts_model, tts_voice, stream, len(text))
         # Retry only the initial connection; once bytes start flowing, errors
         # propagate (re-playing mid-stream audio would duplicate playback).

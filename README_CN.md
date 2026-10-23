@@ -49,7 +49,7 @@ pip install -e fusion-core
 pip install -e ".[test]"        # 在 fusion-speech/ 下执行
 
 # 先启动 fusion-speech 委托的推理引擎
-~/claude-home/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh start
 
 # 启动语音守护进程
 ./start.sh start
@@ -214,7 +214,7 @@ curl http://127.0.0.1:11465/metrics
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 148 passed, 5 skipped
+FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 183 passed, 6 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
@@ -223,7 +223,7 @@ ruff check fusion_speech tests                         # clean
 `FUSION_SPEECH_REAL_LOAD=1`（并确保 fusion-mlx 已起）来运行：
 
 ```bash
-~/claude-home/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh start
 FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=<your-key> \
   pytest tests/test_m6_real_load_integration.py -m real_load -v
 ```

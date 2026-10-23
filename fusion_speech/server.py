@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import os
 import signal
@@ -24,6 +25,7 @@ from fusion_speech.logging import setup_logging
 from fusion_speech.metrics import metrics, render_prometheus
 from fusion_speech.mlx_bridge import probe_mlx_audio_lane
 from fusion_speech.state import DaemonState
+from fusion_speech.ws_ingress import WsIngressSession
 
 logger = logging.getLogger(__name__)
 
@@ -351,6 +353,111 @@ class SpeechDaemon:
                 self.unsubscribe(q)
                 with contextlib.suppress(Exception):
                     await ws.close()
+
+        # M-A (issue #2): WS PCM audio ingress — alternative transport to the
+        # local mic. Bidirectional: client sends binary 16k mono PCM frames
+        # (int16 LE default, float32 via start.encoding) plus JSON control
+        # frames; server sends JSON events (same speech.* contract as
+        # /stream/stt) and, with tts_sink=ws, binary int16 TTS PCM. Full-duplex
+        # sessions keep VAD live during playback and fire speech.barge_in.
+        @app.websocket("/stream/audio")
+        async def _stream_audio(ws: WebSocket):
+            if not self.config.ws_ingress_enabled:
+                await ws.close(code=4404, reason="ws ingress disabled")
+                return
+            if self.config.ws_ingress_token:
+                token = ws.query_params.get("token", "") or ws.headers.get("x-fusion-speech-token", "")
+                if token != self.config.ws_ingress_token:
+                    await ws.close(code=4401, reason="unauthorized")
+                    return
+            await ws.accept()
+            session = None
+            try:
+                while True:
+                    msg = await ws.receive()
+                    if msg["type"] == "websocket.disconnect":
+                        break
+                    if msg.get("text") is not None:
+                        try:
+                            frame = json.loads(msg["text"])
+                        except (json.JSONDecodeError, ValueError) as e:
+                            await ws.send_json({"event": "speech.session.error", "error": f"bad json: {e}"})
+                            continue
+                        if not isinstance(frame, dict):
+                            await ws.send_json({"event": "speech.session.error", "error": "control frame must be an object"})
+                            continue
+                        ftype = frame.get("type", "")
+                        if ftype == "start":
+                            if session is not None:
+                                await ws.send_json(
+                                    {"event": "speech.session.error", "error": "session already started"}
+                                )
+                                continue
+                            session = WsIngressSession(
+                                self,
+                                ws,
+                                mode=frame.get("mode", "full_duplex"),
+                                encoding=frame.get("encoding", "int16"),
+                                tts_sink=frame.get("tts_sink", "ws"),
+                                asr_engine=frame.get("asr_engine", "local"),
+                                tts_engine=frame.get("tts_engine", "local"),
+                                barge_in=frame.get("barge_in"),
+                                reprompt_min_confidence=frame.get("reprompt_min_confidence"),
+                                session_id=frame.get("session", ""),
+                            )
+                            try:
+                                await session.start()
+                            except Exception as e:
+                                logger.warning("ws session start rejected: %s", e)
+                                await ws.send_json({"event": "speech.session.error", "error": str(e)})
+                                await session.stop()
+                                session = None
+                        elif ftype == "stop":
+                            if session is not None:
+                                await session.stop()
+                                session = None
+                        elif ftype == "speak":
+                            if session is None:
+                                await ws.send_json({"event": "speech.session.error", "error": "session not started"})
+                                continue
+                            result = await session.speak(frame)
+                            if result.get("error"):
+                                await ws.send_json(
+                                    {"event": "speech.session.error", "error": result["error"]}
+                                )
+                        elif ftype == "tts_cancel":
+                            if session is not None:
+                                await session.cancel_tts()
+                        else:
+                            await ws.send_json(
+                                {"event": "speech.session.error", "error": f"unknown control type {ftype!r}"}
+                            )
+                    elif msg.get("bytes") is not None:
+                        if session is None:
+                            await ws.send_json(
+                                {"event": "speech.session.error", "error": "session not started"}
+                            )
+                            continue
+                        data = msg["bytes"]
+                        if len(data) > self.config.ws_max_frame_bytes:
+                            await ws.send_json(
+                                {
+                                    "event": "speech.session.error",
+                                    "error": f"audio frame too large: {len(data)} > {self.config.ws_max_frame_bytes}",
+                                }
+                            )
+                            continue
+                        try:
+                            session.feed(data)
+                        except ValueError as e:
+                            await ws.send_json({"event": "speech.session.error", "error": str(e)})
+            except WebSocketDisconnect:
+                pass
+            except Exception:
+                logger.exception("stream/audio websocket error")
+            finally:
+                if session is not None:
+                    await session.stop()
 
         self._app = app
         return app
