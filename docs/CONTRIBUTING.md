@@ -53,9 +53,9 @@ model weights and the `/v1/audio/*` endpoints on `localhost:11434`.
 
 ```bash
 # inference engine
-~/claude-home/fusion-mlx/start.sh start
-~/claude-home/fusion-mlx/start.sh status
-~/claude-home/fusion-mlx/start.sh stop
+~/fusion/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh status
+~/fusion/fusion-mlx/start.sh stop
 
 # the speech daemon (127.0.0.1:11465 + UDS)
 ./start.sh start
@@ -98,7 +98,7 @@ pytest tests/test_foo.py::test_bar -v
 Real-load (start fusion-mlx first, then opt in):
 
 ```bash
-~/claude-home/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh start
 FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=dahai168 \
   pytest tests/test_m6_real_load_integration.py -m real_load -v
 ```
@@ -246,7 +246,7 @@ When a change touches the inference delegation path (STT/TTS bridge, streaming
 transcribe, TTS playback), the real-load suite must actually load models — no
 mocking the model output.
 
-- Start/stop fusion-mlx with `~/claude-home/fusion-mlx/start.sh start|stop`.
+- Start/stop fusion-mlx with `~/fusion/fusion-mlx/start.sh start|stop`.
 - If a model is missing, download via the mirror **`https://hf-mirror.com`**
   (set `HF_MIRROR=https://hf-mirror.com`), not the upstream HF endpoint.
 - Model cache: `~/.fusion-mlx/models`.

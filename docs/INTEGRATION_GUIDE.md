@@ -33,8 +33,8 @@ fusion-speech needs the inference engine running and the daemon itself up.
 
 ```bash
 # fusion-mlx owns the model weights (STT/TTS) on localhost:11434
-~/claude-home/fusion-mlx/start.sh start
-~/claude-home/fusion-mlx/start.sh status
+~/fusion/fusion-mlx/start.sh start
+~/fusion/fusion-mlx/start.sh status
 
 # fusion-speech daemon on 127.0.0.1:11465 (HTTP) + UDS JSON-RPC
 ./start.sh start

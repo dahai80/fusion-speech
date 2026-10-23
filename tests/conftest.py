@@ -69,7 +69,7 @@ def real_daemon():
     if not _real_load_enabled():
         pytest.skip("FUSION_SPEECH_REAL_LOAD=1 not set; skipping real-load integration")
     if not _mlx_reachable():
-        pytest.skip("fusion-mlx not reachable on 11434 (start ~/claude-home/fusion-mlx/start.sh start)")
+        pytest.skip("fusion-mlx not reachable on 11434 (start ~/fusion/fusion-mlx/start.sh start)")
 
     started_here = False
     if _speech_reachable():

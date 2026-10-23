@@ -158,6 +158,12 @@ class MetricsRegistry:
         self.speaking = _Gauge(
             "speaking", "1 when TTS player active, else 0."
         )
+        self.sessions = _Gauge(
+            "sessions", "Current voice sessions (WS ingress)."
+        )
+        self.barge_in_total = _Counter(
+            "barge_in_total", "Total barge-in interruptions (VAD onset during TTS playback)."
+        )
 
     def uptime_seconds(self) -> float:
         return time.time() - self.start_time
@@ -233,6 +239,8 @@ def render_prometheus() -> str:
     emit_gauge(reg.listening)
     emit_gauge(reg.wake_armed)
     emit_gauge(reg.speaking)
+    emit_gauge(reg.sessions)
+    emit_counter(reg.barge_in_total)
     lines.append("# HELP uptime_seconds Daemon uptime in seconds.")
     lines.append("# TYPE uptime_seconds gauge")
     lines.append(f"uptime_seconds {reg.uptime_seconds()}")

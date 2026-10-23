@@ -492,7 +492,7 @@ after merge.
   `synthesize_stream` over HTTP; checkpoint = real-load STT (`openai/whisper-tiny`) +
   TTS (Qwen3-TTS), transcribe/synthesize playable. **done** (STT needed upstream
   fusion-mlx discovery fix, issue #649). (uses key from settings.json; start/stop
-  fusion-mlx via `~/claude-home/fusion-mlx/start.sh`)
+  fusion-mlx via `~/fusion/fusion-mlx/start.sh`)
 - **M2** — realtime mic capture + streaming ASR: ring_buffer, audio_source, vad,
   stt_stream, `speech.asr`, WS `/stream/stt`. **done** — ring buffer (SPSC,
   drop-oldest), energy-gate + Silero ONNX VAD (64-sample context fix), streaming

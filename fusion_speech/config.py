@@ -29,6 +29,11 @@ DEFAULT_WS_KEEPALIVE_S = 30.0
 DEFAULT_WS_SUBSCRIBER_QUEUE = 64
 DEFAULT_WAKE_CHUNK_SAMPLES = 1280
 DEFAULT_PROBE_INTERVAL_S = 60.0
+DEFAULT_WS_INGRESS = True
+DEFAULT_WS_TOKEN = ""
+DEFAULT_WS_MAX_FRAME_BYTES = 65536
+DEFAULT_BARGE_IN = True
+DEFAULT_REPROMPT_CONFIDENCE = 0.0
 REQUIRED_SAMPLE_RATE = 16000
 REQUIRED_CHANNELS = 1
 REQUIRED_WAKE_CHUNK = 1280
@@ -50,6 +55,13 @@ def _env_float(key: str, default: float) -> float:
     except ValueError:
         logger.warning("config: %s=%r not float, fallback default %s", key, raw, default)
         return default
+
+
+def _env_bool(key: str, default: bool) -> bool:
+    raw = os.environ.get(key, "").strip().lower()
+    if not raw:
+        return default
+    return raw in ("1", "true", "yes", "on")
 
 
 @dataclass
@@ -101,6 +113,24 @@ class SpeechConfig:
     probe_interval_s: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_PROBE_INTERVAL_S", DEFAULT_PROBE_INTERVAL_S)
     )
+    # M-A/M-B (issue #2): WS PCM ingress on /stream/audio. Token is optional —
+    # the HTTP port is localhost-bound; multi-tenant auth stays upstream
+    # (fusion-identity / control plane) per the issue's non-goals.
+    ws_ingress_enabled: bool = field(
+        default_factory=lambda: _env_bool("FUSION_SPEECH_WS_INGRESS", DEFAULT_WS_INGRESS)
+    )
+    ws_ingress_token: str = field(
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_WS_TOKEN", DEFAULT_WS_TOKEN).strip()
+    )
+    ws_max_frame_bytes: int = field(
+        default_factory=lambda: _env_int("FUSION_SPEECH_WS_MAX_FRAME", DEFAULT_WS_MAX_FRAME_BYTES)
+    )
+    barge_in_enabled: bool = field(
+        default_factory=lambda: _env_bool("FUSION_SPEECH_BARGE_IN", DEFAULT_BARGE_IN)
+    )
+    reprompt_min_confidence: float = field(
+        default_factory=lambda: _env_float("FUSION_SPEECH_REPROMPT_CONFIDENCE", DEFAULT_REPROMPT_CONFIDENCE)
+    )
     tts_output_device: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
     log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
@@ -143,6 +173,12 @@ class SpeechConfig:
             raise ValueError(f"ws_subscriber_queue must be > 0, got {self.ws_subscriber_queue}")
         if self.probe_interval_s <= 0:
             raise ValueError(f"probe_interval_s must be > 0, got {self.probe_interval_s}")
+        if self.ws_max_frame_bytes <= 0:
+            raise ValueError(f"ws_max_frame_bytes must be > 0, got {self.ws_max_frame_bytes}")
+        if not 0 <= self.reprompt_min_confidence <= 1:
+            raise ValueError(
+                f"reprompt_min_confidence must be in [0, 1] (0 = disabled), got {self.reprompt_min_confidence}"
+            )
 
 
 def _resolve_socket_path() -> str:

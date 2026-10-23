@@ -4,7 +4,6 @@ import asyncio
 import base64
 import logging
 import os
-import wave
 
 import pytest
 from _uds_client import UdsJsonRpcClient
@@ -17,9 +16,10 @@ _FIXTURE_WAV = os.path.join(os.path.dirname(__file__), "fixtures", "assistant_ba
 
 
 def _load_wav_b64(path: str) -> str:
-    with wave.open(path, "rb") as wf:
-        frames = wf.readframes(wf.getnframes())
-    return base64.b64encode(frames).decode("ascii")
+    # whole-file base64 incl. the RIFF header: fusion-mlx decodes the uploaded
+    # file as a container — raw headerless PCM frames fail with DecodeError
+    with open(path, "rb") as f:
+        return base64.b64encode(f.read()).decode("ascii")
 
 
 @pytest.fixture(scope="module")
@@ -128,3 +128,66 @@ async def test_step5_wake_arm_no_false_fire(rpc: UdsJsonRpcClient):
     disarmed = await _no_error(await rpc.call("speech.wake", {"arm": False}), "speech.wake")
     assert disarmed.get("armed") is False, f"wake did not disarm: {disarmed}"
     logger.info("step5: arm/disarm clean, hotwords=%s", armed.get("hotwords"))
+
+
+async def test_step6_ws_ingress_full_duplex(real_daemon):
+    # Step 6 (issue #2 M-A/M-B): WS PCM ingress on the real daemon — start a
+    # full-duplex session, feed silence (no spurious ASR), speak via the WS
+    # (real Kokoro TTS through fusion-mlx, binary PCM back), cancel mid-stream
+    # (barge-in path), stop. Exercises /stream/audio end-to-end.
+    import json as _json
+
+    import numpy as np
+    import websockets
+
+    uri = "ws://127.0.0.1:11465/stream/audio"
+    async with websockets.connect(uri, max_size=8 * 1024 * 1024) as ws:
+        await ws.send(_json.dumps({"type": "start", "mode": "full_duplex", "encoding": "int16"}))
+        info = _json.loads(await asyncio.wait_for(ws.recv(), timeout=15))
+        assert info["event"] == "speech.session.info", info
+        session_id = info["session"]
+        logger.info("step6: session %s started (mode=%s)", session_id, info["mode"])
+
+        # feed 1s of silence: must NOT open a VAD segment (no false ASR)
+        silence = np.zeros(16000, dtype="<i2").tobytes()
+        await ws.send(silence)
+
+        # speak over the WS: real TTS via fusion-mlx, binary PCM frames back
+        await ws.send(_json.dumps({"type": "speak", "text": "Voice session is live."}))
+        audio_bytes = 0
+        cancelled = False
+        deadline = asyncio.get_event_loop().time() + 60
+        got_speaking = False
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                msg = await asyncio.wait_for(ws.recv(), timeout=5)
+            except TimeoutError:
+                break
+            if isinstance(msg, bytes):
+                audio_bytes += len(msg)
+                if audio_bytes > 4096 and not cancelled:
+                    # audio is flowing — cancel mid-stream (barge-in budget)
+                    await ws.send(_json.dumps({"type": "tts_cancel"}))
+                    cancelled = True
+                continue
+            payload = _json.loads(msg)
+            if payload.get("event") == "speech.tts":
+                if payload.get("state") == "speaking":
+                    got_speaking = True
+                if payload.get("state") == "cancelled":
+                    break
+        assert got_speaking, "never saw speech.tts speaking on the WS session"
+        assert audio_bytes > 0, "no binary TTS PCM frames received over the WS"
+        logger.info("step6: tts audio=%d bytes cancelled=%s", audio_bytes, cancelled)
+
+        await ws.send(_json.dumps({"type": "stop"}))
+
+    # listener slot must be released after the session stops
+    client = UdsJsonRpcClient(real_daemon, timeout=30.0)
+    await client.connect()
+    try:
+        status = await _no_error(await client.call("speech.status"), "speech.status")
+    finally:
+        await client.close()
+    assert status.get("listening") is False, "listener still active after ws session stop"
+    logger.info("step6: ws session stopped cleanly, listener released")
