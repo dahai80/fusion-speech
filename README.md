@@ -114,6 +114,7 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_WS_MAX_FRAME` | `65536` | max WS audio frame size in bytes (larger frames rejected) |
 | `FUSION_SPEECH_BARGE_IN` | `1` | default barge-in armed for full-duplex sessions |
 | `FUSION_SPEECH_REPROMPT_CONFIDENCE` | `0.0` | ASR finals with confidence below this emit `speech.reprompt` (0 = disabled; empty transcripts always reprompt) |
+| `FUSION_SPEECH_TTS_QUEUE_MAX` | `8` | per-session speak-frame queue depth; overflow drops the oldest frame and emits `speech.queue_overflow` |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -193,7 +194,17 @@ Protocol (one connection = one voice session, one ASR stream at a time):
 
 Server frames: JSON events (same `speech.*` contract as `/stream/stt`, plus
 `speech.session` state transitions, `speech.barge_in`, `speech.reprompt`,
-`speech.session.error`) and binary int16 PCM while TTS is streaming to the WS.
+`speech.queue_overflow`, `speech.session.error`) and binary int16 PCM while TTS
+is streaming to the WS.
+
+TTS queueing: a streaming agent feeds `speak` frames sentence by sentence,
+milliseconds apart — a `speak` arriving while synthesis is active is queued
+(FIFO, depth `FUSION_SPEECH_TTS_QUEUE_MAX`), not rejected, and plays in order
+the moment the previous sentence finishes (no client-side serialization gate
+needed). Overflow drops the oldest queued sentence and emits
+`speech.queue_overflow` (`{queue_depth}`) so the client can decide to skip.
+`tts_cancel` and barge-in clear the queue along with the in-flight synthesis —
+the interrupted answer's remaining sentences are stale and never play.
 
 Full-duplex + barge-in (the point of the mode): the client plays the TTS audio
 and runs AEC, so server-side VAD stays live during playback. When the user
@@ -238,6 +249,7 @@ report state gauges; the ASR/TTS bridges report throughput.
 | `speaking` | Gauge | — | 1 when TTS player active, else 0 |
 | `sessions` | Gauge | — | current WS voice sessions |
 | `barge_in_total` | Counter | — | barge-in interruptions (VAD onset during playback) |
+| `tts_queue_overflow_total` | Counter | — | speak frames dropped from a full per-session TTS queue |
 
 `speech.status` also returns a metrics summary (`uptime`, `rpc_total`,
 `errors_total`). Scrape with:
@@ -499,6 +511,13 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
     fixed).
   - Verified: 183 tests green + 6 real-load steps green (real STT/TTS/wake
     + WS session), ruff clean.
+  - **M-E** TTS queueing (issue #3). **done** — concurrent `speak` frames
+    queue FIFO per session (depth `FUSION_SPEECH_TTS_QUEUE_MAX`, default 8)
+    instead of aborting the session; overflow drops the oldest frame and
+    emits `speech.queue_overflow`; `tts_cancel` and barge-in clear the queue
+    with the in-flight synthesis; sentence N+1 starts the moment N finishes
+    (no client-side serialization, no inter-sentence gap beyond synthesis
+    latency). Metric: `tts_queue_overflow_total`.
 - **0.1.1** — bilingual docs (Chinese `README_CN.md`), scenario-based
   [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) and developer
   [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md); patch over 0.1.0rc1. No runtime

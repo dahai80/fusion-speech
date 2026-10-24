@@ -12,7 +12,20 @@ logger = logging.getLogger(__name__)
 
 # Default histogram buckets (seconds) — RPC + transcribe latency profile.
 _DEFAULT_BUCKETS = (
-    0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0, 120.0,
+    0.005,
+    0.01,
+    0.025,
+    0.05,
+    0.1,
+    0.25,
+    0.5,
+    1.0,
+    2.5,
+    5.0,
+    10.0,
+    30.0,
+    60.0,
+    120.0,
 )
 
 
@@ -122,47 +135,28 @@ class MetricsRegistry:
     # methods are the public inc/observe/set surface used across the daemon.
     def __init__(self):
         self.start_time = time.time()
-        self.rpc_requests_total = _Counter(
-            "rpc_requests_total", "Total RPC requests by method.", ("method",)
-        )
-        self.rpc_errors_total = _Counter(
-            "rpc_errors_total", "Total RPC handler errors by method.", ("method",)
-        )
-        self.rpc_duration_seconds = _Histogram(
-            "rpc_duration_seconds", "RPC handler duration in seconds.", ("method",)
-        )
-        self.asr_segments_total = _Counter(
-            "asr_segments_total", "Total ASR segments closed (VAD segment-close)."
-        )
+        self.rpc_requests_total = _Counter("rpc_requests_total", "Total RPC requests by method.", ("method",))
+        self.rpc_errors_total = _Counter("rpc_errors_total", "Total RPC handler errors by method.", ("method",))
+        self.rpc_duration_seconds = _Histogram("rpc_duration_seconds", "RPC handler duration in seconds.", ("method",))
+        self.asr_segments_total = _Counter("asr_segments_total", "Total ASR segments closed (VAD segment-close).")
         self.asr_transcribe_seconds = _Histogram(
             "asr_transcribe_seconds", "ASR per-segment transcribe latency in seconds."
         )
         self.asr_segments_dropped_total = _Counter(
             "asr_segments_dropped_total", "ASR segments dropped by R4 backpressure."
         )
-        self.wake_fires_total = _Counter(
-            "wake_fires_total", "Total wake-word fires."
-        )
-        self.tts_speak_total = _Counter(
-            "tts_speak_total", "Total TTS speak invocations."
-        )
-        self.subscribers = _Gauge(
-            "subscribers", "Current WS/event subscribers."
-        )
-        self.listening = _Gauge(
-            "listening", "1 when ASR listener active, else 0."
-        )
-        self.wake_armed = _Gauge(
-            "wake_armed", "1 when wake engine armed, else 0."
-        )
-        self.speaking = _Gauge(
-            "speaking", "1 when TTS player active, else 0."
-        )
-        self.sessions = _Gauge(
-            "sessions", "Current voice sessions (WS ingress)."
-        )
+        self.wake_fires_total = _Counter("wake_fires_total", "Total wake-word fires.")
+        self.tts_speak_total = _Counter("tts_speak_total", "Total TTS speak invocations.")
+        self.subscribers = _Gauge("subscribers", "Current WS/event subscribers.")
+        self.listening = _Gauge("listening", "1 when ASR listener active, else 0.")
+        self.wake_armed = _Gauge("wake_armed", "1 when wake engine armed, else 0.")
+        self.speaking = _Gauge("speaking", "1 when TTS player active, else 0.")
+        self.sessions = _Gauge("sessions", "Current voice sessions (WS ingress).")
         self.barge_in_total = _Counter(
             "barge_in_total", "Total barge-in interruptions (VAD onset during TTS playback)."
+        )
+        self.tts_queue_overflow_total = _Counter(
+            "tts_queue_overflow_total", "Total speak frames dropped from a full per-session TTS queue (issue #3)."
         )
 
     def uptime_seconds(self) -> float:
@@ -241,6 +235,7 @@ def render_prometheus() -> str:
     emit_gauge(reg.speaking)
     emit_gauge(reg.sessions)
     emit_counter(reg.barge_in_total)
+    emit_counter(reg.tts_queue_overflow_total)
     lines.append("# HELP uptime_seconds Daemon uptime in seconds.")
     lines.append("# TYPE uptime_seconds gauge")
     lines.append(f"uptime_seconds {reg.uptime_seconds()}")

@@ -41,6 +41,8 @@ def test_valid_default_config_constructs():
         ("ws_keepalive_s", 0.0),
         ("ws_subscriber_queue", 0),
         ("probe_interval_s", 0.0),
+        ("tts_queue_max", 0),
+        ("tts_queue_max", -3),
     ],
 )
 def test_invalid_fields_raise(field, bad_value):

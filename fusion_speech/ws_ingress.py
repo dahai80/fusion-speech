@@ -11,7 +11,7 @@ import numpy as np
 from fusion_speech.engines import make_tts_engine, tts_engine_adapter
 from fusion_speech.metrics import metrics
 from fusion_speech.ring_buffer import RingBuffer
-from fusion_speech.session import VoiceSession
+from fusion_speech.session import SESSION_INTERRUPTED, SESSION_LISTENING, SESSION_SPEAKING, VoiceSession
 from fusion_speech.tts_playback import StreamingPlayer
 
 logger = logging.getLogger(__name__)
@@ -191,7 +191,15 @@ class WsIngressSession:
         self._pump_queue: asyncio.Queue | None = None
         self.player: StreamingPlayer | None = None
         self.sink: WsTtsSink | None = None
+        # M-E (issue #3): bounded FIFO of pending speak frames. A streaming
+        # agent sends sentences milliseconds apart; rejecting the second one
+        # killed the session, so they queue instead and a single worker drains
+        # them in order. Overflow drops the OLDEST frame and emits
+        # speech.queue_overflow (drop-oldest: the newest sentence is the one
+        # still worth playing).
+        self._speak_queue: asyncio.Queue = asyncio.Queue(maxsize=self.config.tts_queue_max)
         self._speak_task: asyncio.Task | None = None
+        self._speak_inflight = False
         self._stopping = False
         # Ownership latch: a session rejected at start (ASR slot busy) must not
         # tear down shared daemon state in stop() — it never took any.
@@ -247,6 +255,9 @@ class WsIngressSession:
         if not self.session.speaking or not self.session.barge_in:
             return
         t0 = time.monotonic()
+        # queued sentences belong to the interrupted answer — drop them with
+        # the in-flight audio, or the user's question gets answered anyway
+        self._clear_speak_queue(reason="barge-in")
         if self.sink is not None:
             self.sink.flush()
         if self.player is not None and self.player.active:
@@ -266,39 +277,125 @@ class WsIngressSession:
             self.source.feed(pcm)
 
     async def speak(self, params: dict) -> dict:
-        # Runs as a task so the WS receive loop keeps consuming audio (the
-        # whole point of full-duplex). One playback at a time.
-        if self._speak_task is not None and not self._speak_task.done():
-            return {"error": "already speaking"}
+        # M-E (issue #3): never reject a concurrent speak — enqueue it. The
+        # worker synthesizes FIFO, so sentence N+1 starts the moment N's
+        # playback finishes (no client-side serialization gate needed).
         text = params.get("text", "")
         if not text:
             return {"error": "text required"}
         if len(text) > 5000:
             return {"error": "text too long"}
-        self._speak_task = asyncio.create_task(
-            self._speak(
-                text,
-                voice=params.get("voice", ""),
-                model=params.get("model", ""),
-                ref_audio=params.get("ref_audio", ""),
-                ref_text=params.get("ref_text", ""),
-            )
-        )
-        return {"speaking": True, "session": self.session_id}
-
-    async def _speak(
-        self, text: str, *, voice: str = "", model: str = "", ref_audio: str = "", ref_text: str = ""
-    ) -> None:
-        if not await self.session.begin_speak():
+        if self._stopping:
+            return {"error": "session stopping"}
+        item = {
+            "text": text,
+            "voice": params.get("voice", ""),
+            "model": params.get("model", ""),
+            "ref_audio": params.get("ref_audio", ""),
+            "ref_text": params.get("ref_text", ""),
+        }
+        if self._speak_task is None or self._speak_task.done():
+            # no worker: spawn one; the queue is empty so the put cannot fail
+            self._speak_queue.put_nowait(item)
+            self._speak_task = asyncio.create_task(self._speak_worker())
+            return {"speaking": True, "session": self.session_id, "queue_depth": 0}
+        try:
+            self._speak_queue.put_nowait(item)
+        except asyncio.QueueFull:
+            # drop-oldest overflow: make room, retry once, tell downstream
+            with contextlib.suppress(asyncio.QueueEmpty):
+                self._speak_queue.get_nowait()
+            with contextlib.suppress(asyncio.QueueFull):
+                self._speak_queue.put_nowait(item)
+            metrics.tts_queue_overflow_total.inc()
             await self.daemon.broadcast(
-                {"event": "speech.tts", "state": "error", "error": "session not listening", "session": self.session_id}
+                {
+                    "event": "speech.queue_overflow",
+                    "session": self.session_id,
+                    "queue_depth": self._speak_queue.qsize(),
+                    "ts": time.time(),
+                }
+            )
+        queued = self._speak_inflight
+        return {
+            "queued" if queued else "speaking": True,
+            "session": self.session_id,
+            "queue_depth": self._speak_queue.qsize(),
+        }
+
+    def _clear_speak_queue(self, *, reason: str) -> int:
+        # Drop every pending speak frame (tts_cancel / barge-in / item
+        # failure): the queued sentences belong to the aborted utterance and
+        # are stale the moment playback stops.
+        dropped = 0
+        while True:
+            try:
+                self._speak_queue.get_nowait()
+                dropped += 1
+            except asyncio.QueueEmpty:
+                break
+        if dropped:
+            logger.info("ws session %s dropped %d queued speak frames (%s)", self.session_id, dropped, reason)
+        return dropped
+
+    async def _speak_worker(self) -> None:
+        # Single consumer of the speak queue — one playback at a time, in
+        # order. Stays alive between sentences (idle await on get()) so a
+        # follow-up speak reuses the same worker and the same session state.
+        try:
+            while True:
+                item = await self._speak_queue.get()
+                self._speak_inflight = True
+                try:
+                    await self._speak_item(item)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    logger.exception("ws session %s speak item failed", self.session_id)
+                    await self.daemon.broadcast(
+                        {"event": "speech.tts", "state": "error", "error": "speak failed", "session": self.session_id}
+                    )
+                    # fail-soft: recover the state machine so the next speak
+                    # is not stuck behind a half-spoken session
+                    with contextlib.suppress(Exception):
+                        await self.session.end_speak(cancelled=True)
+                finally:
+                    self._speak_inflight = False
+        except asyncio.CancelledError:
+            raise
+
+    async def _speak_item(self, item: dict) -> None:
+        state = self.session.state
+        stopped_asr = False
+        if state == SESSION_LISTENING:
+            if not await self.session.begin_speak():
+                await self.daemon.broadcast(
+                    {
+                        "event": "speech.tts",
+                        "state": "error",
+                        "error": "session not listening",
+                        "session": self.session_id,
+                    }
+                )
+                return
+            if not self.full_duplex:
+                # half-duplex: mic-era behavior — ASR paused during playback so
+                # the outgoing audio is never transcribed (no browser AEC
+                # assumed). Queued continuations keep it paused until the
+                # whole queue drains.
+                with contextlib.suppress(Exception):
+                    await self.daemon.asr.stop_listening()
+                stopped_asr = True
+        elif state not in (SESSION_SPEAKING, SESSION_INTERRUPTED):
+            await self.daemon.broadcast(
+                {
+                    "event": "speech.tts",
+                    "state": "error",
+                    "error": f"session cannot speak in state {state}",
+                    "session": self.session_id,
+                }
             )
             return
-        if not self.full_duplex:
-            # half-duplex: mic-era behavior — ASR paused during playback so
-            # the outgoing audio is never transcribed (no browser AEC assumed).
-            with contextlib.suppress(Exception):
-                await self.daemon.asr.stop_listening()
         engine = make_tts_engine(self.tts_engine_name, self.config)
         sink = None
         stream_factory = None
@@ -312,26 +409,37 @@ class WsIngressSession:
         self.player = StreamingPlayer(
             self.config,
             notifier=self.daemon.broadcast,
-            synthesize=tts_engine_adapter(engine, ref_audio=ref_audio, ref_text=ref_text),
+            synthesize=tts_engine_adapter(
+                engine, ref_audio=item.get("ref_audio", ""), ref_text=item.get("ref_text", "")
+            ),
             stream_factory=stream_factory,
         )
         try:
-            result = await self.player.speak(text, voice=voice, model=model)
+            result = await self.player.speak(item["text"], voice=item.get("voice", ""), model=item.get("model", ""))
         finally:
             self.player = None
             self.sink = None
-        await self.session.end_speak(cancelled=bool(result.get("cancelled")))
-        if not self.full_duplex and not self._stopping:
-            with contextlib.suppress(Exception):
-                await self.daemon.asr.start_listening(audio_source=self.source)
+        cancelled = bool(result.get("cancelled"))
+        if cancelled:
+            self._clear_speak_queue(reason="playback cancelled")
+        if self._speak_queue.empty():
+            # queue drained: hand the state back to listening (speaking or
+            # interrupted both land here) and re-arm half-duplex ASR
+            await self.session.end_speak(cancelled=cancelled)
+            if stopped_asr and not self._stopping:
+                with contextlib.suppress(Exception):
+                    await self.daemon.asr.start_listening(audio_source=self.source)
+        # else: more sentences queued — stay in speaking, worker loops
 
     async def cancel_tts(self) -> dict:
         player = self.player
+        self._clear_speak_queue(reason="tts_cancel")
         if player is None:
-            return {"stopped": False}
+            return {"stopped": False, "queue_cleared": True}
         if self.sink is not None:
             self.sink.flush()
         result = await player.cancel()
+        result["queue_cleared"] = True
         return result
 
     async def stop(self) -> None:
@@ -343,6 +451,7 @@ class WsIngressSession:
             # the shared ASR slot here would kill the ACTIVE session's listener)
             logger.info("ws session %s stop: never started, nothing to release", self.session_id)
             return
+        self._clear_speak_queue(reason="session stop")
         if self._speak_task is not None and not self._speak_task.done():
             self._speak_task.cancel()
             # CancelledError is BaseException on py3.14 — suppress it with the

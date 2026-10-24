@@ -361,7 +361,11 @@ async def test_r2_download_off_loop():
     await asyncio.sleep(0.02)
     await asyncio.sleep(0.02)
     elapsed = asyncio.get_event_loop().time() - t0
-    res = await asyncio.wait_for(start_task, timeout=10.0)
+    # safety timeout only — the concurrency assertion is `elapsed` above. The
+    # executor load includes a COLD import of openwakeword+onnxruntime (first
+    # test in the suite to touch them, ~7s standalone, more under load), so
+    # 10s false-failed; 60s bounds a hung load without racing a slow import.
+    res = await asyncio.wait_for(start_task, timeout=60.0)
     # the downloader ran (load was attempted off the loop)
     assert called["ensure"] >= 1, "start() did not trigger a download"
     # the loop stayed free during the executor download: elapsed ~50ms
@@ -407,4 +411,3 @@ async def test_r7_fixed_chunk_read():
     # each predict got a fixed 1280 (never 2560), leftover retained not dropped
     assert seen_sizes, "drain never ran a predict"
     assert all(s == 1280 for s in seen_sizes), f"non-fixed frame sizes: {seen_sizes}"
-

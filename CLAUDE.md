@@ -24,7 +24,7 @@ pip install -e fusion-core
 pip install -e ".[test]"
 
 # test (offline, no model load, no live daemon)
-FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 148 passed, 5 skipped
+FUSION_MLX_API_KEY=<your-key> pytest tests/ -q       # verify key first — it rotates
 pytest tests/test_foo.py::test_bar -v                 # single test
 
 # lint (PR must be clean)
@@ -43,7 +43,7 @@ FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=<your-key> \
 Notes:
 
 - `asyncio_mode = "auto"` — async tests need no `@pytest.mark.asyncio`.
-- `FUSION_MLX_API_KEY=<your-key>` is the working local key; a stale `<your-key>` leaking from `~/.zshrc` 401s against fusion-mlx — export the working key explicitly.
+- fusion-mlx API keys rotate — the env var value goes stale with no code change. When tests 401 against fusion-mlx, verify the live key with `curl -H "Authorization: Bearer <key>" http://localhost:11434/v1/models` and export it explicitly (working key as of 2026-10-24: `<your-key>`; `<your-key>` now 401s).
 - Model downloads use mirror `HF_MIRROR=https://hf-mirror.com`; cache `~/.fusion-mlx/models`.
 - Inference-path changes (STT/TTS bridge, streaming, playback) must be verified real-load — never mock model output and claim done.
 

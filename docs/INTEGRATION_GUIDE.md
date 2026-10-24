@@ -369,6 +369,16 @@ resume). The TTS audio itself still played; the degradation is in the realtime
 layers, not the output. Call `speech.wake {arm: true}` again to reset, or
 `speech.reprobe` if the audio lane is also stale.
 
+`speech.speak` over RPC is one-playback-at-a-time (a second call while active
+returns `{"played": false, "error": "already speaking"}` — safe to retry after
+the `done`/`cancelled` event). A streaming voice agent that feeds TTS sentence
+by sentence should use the WS voice session instead (`/stream/audio`): there,
+concurrent `speak` frames queue FIFO per session (depth
+`FUSION_SPEECH_TTS_QUEUE_MAX`, overflow drops the oldest and emits
+`speech.queue_overflow`) so sentence N+1 starts the moment N finishes — no
+client-side serialization gate. See the "Voice Sessions" section of the README
+for the full protocol.
+
 ---
 
 ## 8. Event reference
@@ -382,6 +392,8 @@ message. The `event` field discriminates the type.
 | `speech.wake` | `word`, `ts` | a wake word fired (before the auto-listen handshake) |
 | `speech.tts` | `state` (`starting`/`speaking`/`done`/`cancelled`/`error`), `chars?` (starting/done), `error?` + `degraded?` (error) | `speech.speak` playback progress |
 | `speech.keepalive` | — | idle keepalive every `FUSION_SPEECH_WS_KEEPALIVE_S` (default 30s); distinct event so clients filter real frames from noise |
+| `speech.barge_in` | `session`, `count`, `ts` | WS voice session: user spoke over TTS playback (full-duplex barge-in); playback cancelled, queued sentences dropped |
+| `speech.queue_overflow` | `session`, `queue_depth`, `ts` | WS voice session: the per-session speak queue was full; the oldest queued sentence was dropped |
 | `speech.shutdown` | `ts` | daemon is draining on stop; close the WS and reconnect after restart |
 | `speech.restarted` | `restart_count`, `ts` | this boot is a crash-restart (not the first); emitted right after start so clients know prior state was lost |
 
