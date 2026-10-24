@@ -41,9 +41,10 @@ class DaemonState:
         # Returns the persisted dict (or {} if missing/corrupt). Side-effect:
         # populates self.* from disk so a restart retains restart_count.
         data: dict = {}
-        with contextlib.suppress(FileNotFoundError, json.JSONDecodeError, ValueError), open(
-            self.path, encoding="utf-8"
-        ) as fh:
+        with (
+            contextlib.suppress(FileNotFoundError, json.JSONDecodeError, ValueError),
+            open(self.path, encoding="utf-8") as fh,
+        ):
             data = json.load(fh)
         if not isinstance(data, dict):
             logger.warning("state.json not a dict, starting fresh")

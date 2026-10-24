@@ -53,8 +53,9 @@ async def test_step1_ping_status(rpc: UdsJsonRpcClient):
     assert status.get("port") == 11465
     lane = status.get("mlx_audio_lane") or {}
     assert lane.get("probed") is True, f"audio lane not probed: {lane}"
-    logger.info("step1: ping ok, uptime=%.1fs, lane stt=%s tts=%s",
-                status.get("uptime", 0), lane.get("stt"), lane.get("tts"))
+    logger.info(
+        "step1: ping ok, uptime=%.1fs, lane stt=%s tts=%s", status.get("uptime", 0), lane.get("stt"), lane.get("tts")
+    )
 
 
 async def test_step2_transcribe_real_stt(rpc: UdsJsonRpcClient, wav_b64: str):

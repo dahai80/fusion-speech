@@ -47,11 +47,7 @@ class EventBus:
         # concurrent clear/ set cannot change the set mid-dispatch.
         handlers: list[object] = []
         async with self._lock:
-            if (
-                payload.get("event") == "speech.asr"
-                and payload.get("state") == "final"
-                and self._asr_final_handlers
-            ):
+            if payload.get("event") == "speech.asr" and payload.get("state") == "final" and self._asr_final_handlers:
                 handlers = list(self._asr_final_handlers.values())
         for handler in handlers:
             try:

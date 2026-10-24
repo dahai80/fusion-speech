@@ -101,8 +101,11 @@ def real_daemon():
         time.sleep(0.5)
     else:
         if started_here:
-            subprocess.run(["bash", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "start.sh")), "stop"],
-                           capture_output=True, timeout=30)
+            subprocess.run(
+                ["bash", os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "start.sh")), "stop"],
+                capture_output=True,
+                timeout=30,
+            )
         pytest.skip("fusion-speech /health not reachable within 30s")
 
     if not os.path.exists(_REAL_SOCK):
@@ -128,4 +131,3 @@ def _socket_exists(path: str) -> bool:
         return True
     except Exception:
         return False
-
