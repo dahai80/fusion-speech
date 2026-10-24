@@ -270,6 +270,102 @@ def test_ws_session_half_duplex_pauses_asr_during_speak(ws_daemon):
         ws.send_json({"type": "stop"})
 
 
+def test_ws_session_back_to_back_speaks_queue_in_order(ws_daemon):
+    # Issue #3 acceptance: two speak frames sent back-to-back (ms apart) both
+    # synthesize, in order, without a session error — no client-side
+    # serialization gate needed.
+    first, second = "first spoken sentence", "second spoken sentence follows"
+    client = TestClient(ws_daemon.build_app())
+    with client.websocket_connect("/stream/audio") as ws:
+        ws.send_json({"type": "start", "mode": "full_duplex", "tts_engine": "slow_stub"})
+        ws.receive_json()
+        ws.send_json({"type": "speak", "text": first})
+        ws.send_json({"type": "speak", "text": second})
+        collect: list = []
+        _recv_until(
+            ws,
+            lambda p: p.get("event") == "speech.tts" and p.get("state") == "done" and p.get("chars") == len(second),
+            collect=collect,
+        )
+        _recv_until(ws, lambda p: p.get("event") == "speech.session" and p.get("state") == "listening", collect=collect)
+        dones = [p["chars"] for p in collect if p.get("event") == "speech.tts" and p.get("state") == "done"]
+        assert dones == [len(first), len(second)], f"out of order or missing: {dones}"
+        errors = [p for p in collect if p.get("event") == "speech.session.error"]
+        assert not errors, errors
+        ws.send_json({"type": "stop"})
+
+
+def test_ws_session_speak_queue_overflow_drops_oldest(ws_daemon):
+    # Issue #3: bounded queue (config tts_queue_max). Overflow drops the
+    # OLDEST queued sentence and emits speech.queue_overflow; the rest play.
+    ws_daemon.config.tts_queue_max = 2
+    s1, s2, s3, s4 = "first", "second queued", "third queued sentence", "fourth queued sentence goes"
+    client = TestClient(ws_daemon.build_app())
+    with client.websocket_connect("/stream/audio") as ws:
+        ws.send_json({"type": "start", "mode": "full_duplex", "tts_engine": "slow_stub"})
+        ws.receive_json()
+        ws.send_json({"type": "speak", "text": s1})
+        _recv_until(ws, lambda p: p.get("event") == "speech.tts" and p.get("state") == "speaking")
+        # in-flight now: s2/s3 fill the queue, s4 overflows and evicts s2
+        ws.send_json({"type": "speak", "text": s2})
+        ws.send_json({"type": "speak", "text": s3})
+        ws.send_json({"type": "speak", "text": s4})
+        collect: list = []
+        _recv_until(ws, lambda p: p.get("event") == "speech.queue_overflow", collect=collect)
+        _recv_until(ws, lambda p: p.get("event") == "speech.session" and p.get("state") == "listening", collect=collect)
+        dones = [p["chars"] for p in collect if p.get("event") == "speech.tts" and p.get("state") == "done"]
+        assert len(s1) in dones and len(s3) in dones and len(s4) in dones, dones
+        assert len(s2) not in dones, f"oldest should have been dropped: {dones}"
+        errors = [p for p in collect if p.get("event") == "speech.session.error"]
+        assert not errors, errors
+        ws.send_json({"type": "stop"})
+
+
+def test_ws_tts_cancel_clears_queue_and_rearms(ws_daemon):
+    # Issue #3 acceptance: tts_cancel during a queued/in-flight synthesis
+    # stops everything and re-enables the idle state — the queued sentence
+    # never plays, and a fresh speak right after works.
+    client = TestClient(ws_daemon.build_app())
+    with client.websocket_connect("/stream/audio") as ws:
+        ws.send_json({"type": "start", "mode": "full_duplex", "tts_engine": "slow_stub"})
+        ws.receive_json()
+        ws.send_json({"type": "speak", "text": "in flight when cancelled"})
+        _recv_until(ws, lambda p: p.get("event") == "speech.tts" and p.get("state") == "speaking")
+        ws.send_json({"type": "speak", "text": "queued then dropped sentence"})
+        ws.send_json({"type": "tts_cancel"})
+        collect: list = []
+        _recv_until(ws, lambda p: p.get("event") == "speech.session" and p.get("state") == "listening", collect=collect)
+        dones = [p for p in collect if p.get("event") == "speech.tts" and p.get("state") == "done"]
+        assert not dones, f"queued sentence should not have played: {dones}"
+        cancelled = [p for p in collect if p.get("event") == "speech.tts" and p.get("state") == "cancelled"]
+        assert cancelled, "no speech.tts cancelled event"
+        after = "fresh speak after cancel"
+        ws.send_json({"type": "speak", "text": after})
+        _recv_until(
+            ws, lambda p: p.get("event") == "speech.tts" and p.get("state") == "done" and p.get("chars") == len(after)
+        )
+        ws.send_json({"type": "stop"})
+
+
+def test_ws_barge_in_drops_queued_sentences(ws_daemon):
+    # Barge-in clears the queue with the in-flight audio: the interrupted
+    # answer's remaining sentences are stale and must not play.
+    client = TestClient(ws_daemon.build_app())
+    with client.websocket_connect("/stream/audio") as ws:
+        ws.send_json({"type": "start", "mode": "full_duplex", "tts_engine": "slow_stub"})
+        ws.receive_json()
+        ws.send_json({"type": "speak", "text": "spoken while user interrupts"})
+        _recv_until(ws, lambda p: p.get("event") == "speech.tts" and p.get("state") == "speaking")
+        ws.send_json({"type": "speak", "text": "stale queued sentence"})
+        ws.send_bytes(_sine_pcm(0.5))
+        collect: list = []
+        _recv_until(ws, lambda p: p.get("event") == "speech.barge_in", collect=collect)
+        _recv_until(ws, lambda p: p.get("event") == "speech.session" and p.get("state") == "listening", collect=collect)
+        dones = [p for p in collect if p.get("event") == "speech.tts" and p.get("state") == "done"]
+        assert not dones, f"stale queued sentence played after barge-in: {dones}"
+        ws.send_json({"type": "stop"})
+
+
 def test_ws_session_second_stream_rejected_while_active(ws_daemon):
     client = TestClient(ws_daemon.build_app())
     with client.websocket_connect("/stream/audio") as ws1:

@@ -309,10 +309,13 @@ async def test_real_tts_loads_and_streams():
         notifier=_warm_notifier,
         stream_factory=lambda **k: _FakeOutStream(),
     )
-    await asyncio.wait_for(warm_player.speak("hi", model=model), timeout=120.0)
+    # Timeouts sized for a loaded machine: fusion-mlx may be serving other
+    # Fusion apps (measured: warm speak ~50s standalone, >60s under load), so
+    # the caps must bound a HANG, not race a slow-but-healthy synthesis.
+    await asyncio.wait_for(warm_player.speak("hi", model=model), timeout=300.0)
     await warm_player.cancel()
-    res = await asyncio.wait_for(player.speak("Hello world.", model=model), timeout=60.0)
-    assert res["played"] is True
+    res = await asyncio.wait_for(player.speak("Hello world.", model=model), timeout=180.0)
+    assert res.get("played") is True, f"real TTS speak failed: {res}"
     assert res["sample_rate"] > 0
     states = [n.get("state") for n in notified if n.get("event") == "speech.tts"]
     assert "done" in states

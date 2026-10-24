@@ -105,6 +105,7 @@ asyncio.run(main())
 | `FUSION_SPEECH_WS_SUBSCRIBER_QUEUE` | `64` | 每订阅者推送队列深度（满则丢最旧） |
 | `FUSION_SPEECH_WAKE_CHUNK_SAMPLES` | `1280` | 固定唤醒帧大小 —— 必须 1280（openwakeword 80ms 契约）；非 1280 启动失败 |
 | `FUSION_SPEECH_PROBE_INTERVAL_S` | `60.0` | 后台音频通道重探间隔（秒） |
+| `FUSION_SPEECH_TTS_QUEUE_MAX` | `8` | 每会话 speak 帧排队深度；溢出丢最旧一帧并发 `speech.queue_overflow` |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | 日志级别 |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | 日志目录 |
 | `FUSION_MLX_API_KEY` | （来自 settings.json） | fusion-mlx bearer key |
@@ -179,6 +180,7 @@ HTTP 端口（`127.0.0.1:11465`）上的 `GET /metrics` 返回 Prometheus 文本
 | `listening` | Gauge | — | ASR 监听器激活时为 1，否则 0 |
 | `wake_armed` | Gauge | — | 唤醒引擎激活时为 1，否则 0 |
 | `speaking` | Gauge | — | TTS 播放器激活时为 1，否则 0 |
+| `tts_queue_overflow_total` | Counter | — | 会话 TTS 队列满时丢弃的 speak 帧数 |
 
 `speech.status` 也返回指标摘要（`uptime`、`rpc_total`、`errors_total`）。抓取方式：
 
