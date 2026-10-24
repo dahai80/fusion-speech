@@ -221,6 +221,7 @@ async def test_concurrent_start_stop_listening():
     # calling the real start_listening with a patched source builder.
     daemon.asr.listener = None
     daemon.asr.listening = False
+
     # drive the real AsrService.start_listening with a stubbed source so it
     # builds a StreamingListener without hardware; give it a fake transcribe.
     async def fake_transcribe(cfg, wav, **kw):
@@ -270,9 +271,7 @@ async def test_concurrent_start_stop_listening():
         async def op_stop():
             await daemon.asr.stop_listening()
 
-        await asyncio.gather(
-            op_start(), op_stop(), op_start(), op_stop(), op_start(), op_stop()
-        )
+        await asyncio.gather(op_start(), op_stop(), op_start(), op_stop(), op_start(), op_stop())
         # settle
         await asyncio.sleep(0.01)
     finally:

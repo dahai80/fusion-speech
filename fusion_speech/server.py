@@ -384,7 +384,9 @@ class SpeechDaemon:
                             await ws.send_json({"event": "speech.session.error", "error": f"bad json: {e}"})
                             continue
                         if not isinstance(frame, dict):
-                            await ws.send_json({"event": "speech.session.error", "error": "control frame must be an object"})
+                            await ws.send_json(
+                                {"event": "speech.session.error", "error": "control frame must be an object"}
+                            )
                             continue
                         ftype = frame.get("type", "")
                         if ftype == "start":
@@ -422,9 +424,7 @@ class SpeechDaemon:
                                 continue
                             result = await session.speak(frame)
                             if result.get("error"):
-                                await ws.send_json(
-                                    {"event": "speech.session.error", "error": result["error"]}
-                                )
+                                await ws.send_json({"event": "speech.session.error", "error": result["error"]})
                         elif ftype == "tts_cancel":
                             if session is not None:
                                 await session.cancel_tts()
@@ -434,9 +434,7 @@ class SpeechDaemon:
                             )
                     elif msg.get("bytes") is not None:
                         if session is None:
-                            await ws.send_json(
-                                {"event": "speech.session.error", "error": "session not started"}
-                            )
+                            await ws.send_json({"event": "speech.session.error", "error": "session not started"})
                             continue
                         data = msg["bytes"]
                         if len(data) > self.config.ws_max_frame_bytes:

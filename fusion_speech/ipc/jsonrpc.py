@@ -119,22 +119,16 @@ class JsonRpcDispatcher:
             # Per-Service locks (Wave 3) prevent the state-mutation races; this
             # only bounds wall time.
             result = await asyncio.wait_for(handler(params), timeout=DISPATCH_TIMEOUT)
-            metrics.rpc_duration_seconds.observe(
-                time.monotonic() - started, labels={"method": method}
-            )
+            metrics.rpc_duration_seconds.observe(time.monotonic() - started, labels={"method": method})
             return success_response(msg_id, result)
         except TimeoutError:
             metrics.rpc_errors_total.inc(labels={"method": method})
-            metrics.rpc_duration_seconds.observe(
-                time.monotonic() - started, labels={"method": method}
-            )
+            metrics.rpc_duration_seconds.observe(time.monotonic() - started, labels={"method": method})
             logger.warning("handler %s timed out after %ss", method, DISPATCH_TIMEOUT)
             return error_response(msg_id, -32000, f"handler timeout: {method}")
         except Exception as e:
             metrics.rpc_errors_total.inc(labels={"method": method})
-            metrics.rpc_duration_seconds.observe(
-                time.monotonic() - started, labels={"method": method}
-            )
+            metrics.rpc_duration_seconds.observe(time.monotonic() - started, labels={"method": method})
             logger.exception("handler error for %s", method)
             return error_response(msg_id, -32000, _format_handler_error(e))
 
