@@ -9,7 +9,7 @@ fusion-speech: local-first low-latency speech daemon (streaming STT/TTS/wake) fo
 Two lanes:
 
 - **HTTP** on `127.0.0.1:11465` — `/health`, `/metrics` (Prometheus), `/stream/stt` WebSocket (event push)
-- **UDS JSON-RPC 2.0** at `~/.fusion-speech/run/fusion-speech.sock` (newline-delimited, peer-UID verified fail-closed) — the 12 `speech.*` RPC methods
+- **UDS JSON-RPC 2.0** at `~/.fusion-speech/run/fusion-speech.sock` (newline-delimited, peer-UID verified fail-closed) — the 13 `speech.*` RPC methods (incl. `speech.engines`)
 
 `fusion-core` (in-tree shared base) is a hard prerequisite: `fusion_core.mlx_client.FusionMLXClient`, `fusion_core.http.app.create_app`, `fusion_core.config`, `fusion_core.logging`.
 
@@ -65,6 +65,7 @@ fusion-studio ──JSON-RPC/UDS──▶ fusion-speech ──HTTP──▶ fusi
 - `fusion_speech/vad.py` — energy RMS + Silero ONNX; the 64-sample rolling context prepend is REQUIRED (without it probs collapse)
 - `fusion_speech/audio_source.py` + `ring_buffer.py` — sounddevice 16 kHz mono capture into lock-free SPSC numpy ring (drop-oldest on overrun; realtime callback must not alloc or log — PortAudio thread)
 - `fusion_speech/config.py` — all env vars + `__post_init__` fail-loud validation
+- `fusion_speech/cloud.py` + `cloud_azure.py` — pluggable cloud STT/TTS (issue #4): `CloudSTTEngine`/`CloudTTSEngine` base, retry (retryable slugs only, 0.5/1/2s), reason-slug errors, Azure AI Speech impl (SDK STT for word timestamps + LID dialect detection; REST TTS 16k mono). Credentials per-call from `FUSION_SPEECH_AZURE_KEY`/`_REGION` (fusion-identity issuance; unset = engines unregistered, fail-soft). Optional dep: `pip install -e ".[azure]"`
 - `fusion_speech/metrics.py` — zero-dependency Prometheus text exposition (no `prometheus_client`)
 - `fusion_speech/state.py` — persistent `~/.fusion-speech/run/state.json` (restart count, `speech.restarted` broadcast on crash-restart)
 

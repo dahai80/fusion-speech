@@ -218,3 +218,22 @@ def make_tts_engine(name: str, config, **kwargs) -> TTSEngine:
 
 register_asr_engine("local", LocalASREngine)
 register_tts_engine("local", LocalTTSEngine)
+
+
+def asr_engine_transcribe_adapter(name: str):
+    # StreamingListener takes a transcribe(config, wav_bytes, *, filename,
+    # language) callable. This adapter routes that hook through any registered
+    # engine (issue #4: mic-path cloud ASR). Import stays inside the function:
+    # cloud.py imports this module, so a top-level import would be circular.
+    async def _transcribe(config, wav_bytes, *, filename: str = "audio.wav", language: str = "") -> dict:
+        from fusion_speech.cloud import wav_to_pcm
+
+        engine = make_asr_engine(name, config)
+        if hasattr(engine, "transcribe_wav"):
+            return await engine.transcribe_wav(wav_bytes, language=language)
+        pcm = wav_to_pcm(wav_bytes)
+        await engine.start_stream(language=language)
+        await engine.feed(pcm)
+        return await engine.finish()
+
+    return _transcribe

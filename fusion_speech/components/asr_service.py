@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from fusion_speech.engines import asr_engine_transcribe_adapter
 from fusion_speech.metrics import metrics
 from fusion_speech.mlx_bridge import transcribe_stream
 from fusion_speech.stt_stream import StreamingListener
@@ -26,7 +27,7 @@ class AsrService:
         # already-active check and building two listeners on one mic).
         self._lock = asyncio.Lock()
 
-    async def start_listening(self, audio_source=None) -> dict:
+    async def start_listening(self, audio_source=None, *, engine: str = "local") -> dict:
         async with self._lock:
             if self.listener is not None and self.listener.active:
                 return {"listening": True, "already": True}
@@ -36,9 +37,12 @@ class AsrService:
             # passes wake.source explicitly (borrow), so that path skips the bus.
             if audio_source is None and self._audio_bus is not None:
                 audio_source = self._audio_bus.borrow("asr")
+            # Issue #4: engine != "local" routes the segment transcriber through
+            # the registered engine registry (cloud ASR on the mic path).
+            transcribe = transcribe_stream if engine == "local" else asr_engine_transcribe_adapter(engine)
             self.listener = StreamingListener(
                 self.config,
-                transcribe=transcribe_stream,
+                transcribe=transcribe,
                 notifier=self._notifier,
                 audio_source=audio_source,
             )

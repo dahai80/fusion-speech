@@ -22,6 +22,7 @@ guide covers the recurring integration scenarios with copy-paste Python clients.
 10. [Model selection](#10-model-selection)
 11. [Observability](#11-observability)
 12. [Security boundary](#12-security-boundary)
+13. [Scenario F — Cloud engines (exam pipeline)](#13-scenario-f--cloud-engines-exam-pipeline)
 
 <!-- skeleton — sections filled below -->
 
@@ -168,6 +169,9 @@ async def transcribe(rpc: SpeechRpc, path: str, language: str = "en") -> str:
 Result shape: `{text, language, duration, segments?}`. Input cap: 25 MB base64
 (`MAX_AUDIO_B64`) — larger raises `-32000`.
 
+Pass `engine: "azure"` to route through a registered cloud engine instead of
+fusion-mlx — see [Scenario F](#13-scenario-f--cloud-engines-exam-pipeline).
+
 **Known upstream limit:** fusion-mlx issue #668 — `mlx-audio` Whisper
 `non_speech_tokens` `IndexError` makes `/v1/audio/transcriptions` return 500
 for every model. Until the fix lands, `speech.transcribe` errors with
@@ -213,7 +217,9 @@ def play(wav_bytes: bytes):
 
 If `model`/`voice` are omitted, the daemon uses `FUSION_SPEECH_TTS_MODEL` /
 `FUSION_SPEECH_TTS_VOICE`, falling back to the first probed TTS model if the
-configured id is not loaded in fusion-mlx (logged at WARNING).
+configured id is not loaded in fusion-mlx (logged at WARNING). Pass
+`engine: "azure"` to route through a registered cloud engine (voice then
+defaults to `FUSION_SPEECH_AZURE_TTS_VOICE`).
 
 ---
 
@@ -388,7 +394,7 @@ message. The `event` field discriminates the type.
 
 | Event | Frame fields | When emitted |
 |---|---|---|
-| `speech.asr` | `state` (`listening`/`speaking`/`transcribing`/`final`/`error`), `seq`, and on `final`: `text`, `language?`, `duration?`, `skipped?`; on `error`: `error` | realtime ASR lifecycle; one `listening` on arm, per-segment states during capture, `final` on each transcript |
+| `speech.asr` | `state` (`listening`/`speaking`/`transcribing`/`final`/`error`), `seq`, and on `final`: `text`, `language?`, `duration?`, `skipped?`, `engine?`, `words?` (word/offset_ms/duration_ms/confidence), `dialect?`, `dialect_detected?`; on `error`: `error` | realtime ASR lifecycle; one `listening` on arm, per-segment states during capture, `final` on each transcript. The `engine`/`words`/`dialect*` fields appear when a cloud ASR engine produced the segment |
 | `speech.wake` | `word`, `ts` | a wake word fired (before the auto-listen handshake) |
 | `speech.tts` | `state` (`starting`/`speaking`/`done`/`cancelled`/`error`), `chars?` (starting/done), `error?` + `degraded?` (error) | `speech.speak` playback progress |
 | `speech.keepalive` | — | idle keepalive every `FUSION_SPEECH_WS_KEEPALIVE_S` (default 30s); distinct event so clients filter real frames from noise |
@@ -425,6 +431,9 @@ attribute (HTTP status from fusion-mlx). Examples:
 - `ValueError: audio too large: 30000000 > 26214400 bytes` — over the 25 MB cap.
 - `ValueError: text too long: 6000 > 5000 chars` — over the 5000-char cap.
 - `AudioBridgeError (status 500): ...` — fusion-mlx returned 5xx (e.g. issue #668 STT 500).
+- `ValueError: azure stt failed (AuthenticationFailure): ... reason=azure_auth retryable=False: ...`
+  — cloud engine failure; the `reason=<slug> retryable=<bool>` suffix is the
+  stable machine-readable part (see [Scenario F](#13-scenario-f--cloud-engines-exam-pipeline)).
 
 Input bounds: `speech.transcribe` audio ≤ 25 MB base64 (`MAX_AUDIO_B64`);
 `speech.speak` / `speech.synthesize` text ≤ 5000 chars (`MAX_TEXT`). A request
@@ -524,3 +533,91 @@ fusion-speech is local-first by design. Integration clients should assume:
 Do not expose the UDS socket or HTTP port beyond the host. For a GUI
 integration (e.g. fusion-studio), connect in-process on the same machine and
 let the OS UID check gate access.
+
+---
+
+## 13. Scenario F — Cloud engines (exam pipeline)
+
+For flows that need cloud-grade STT/TTS — the ai-speech-exam pipeline is the
+reference case: word/timestamp alignment for scoring, dialect/accent detection
+to raise human-review priority, read-aloud TTS. **Credentials never live in
+your app**: the daemon holds them (`FUSION_SPEECH_AZURE_KEY` /
+`FUSION_SPEECH_AZURE_REGION`, issued via fusion-identity) and you select the
+engine by name. Check what is registered first:
+
+```python
+engines = (await rpc.call("speech.engines"))["result"]
+# {"asr": ["local", "azure"], "tts": ["local", "azure"]} — "azure" only when
+# the daemon was started with Azure credentials configured
+```
+
+### STT with word alignment + dialect detection
+
+```python
+import re
+
+REASON_RE = re.compile(r"reason=(\S+) retryable=(True|False)")
+
+
+async def exam_transcribe(rpc: SpeechRpc, wav_b64: str) -> dict:
+    resp = await rpc.call(
+        "speech.transcribe",
+        {"audio": wav_b64, "engine": "azure"},
+    )
+    if "error" in resp:
+        return {"ok": False, **_parse_reason(resp["error"]["message"])}
+    result = resp["result"]
+    # words: [{"word", "offset_ms", "duration_ms", "confidence"}, ...]
+    # dialect: detected locale, e.g. "ar-EG" — requires LID candidates
+    #          (FUSION_SPEECH_AZURE_STT_LANGUAGES, e.g. "ar-EG,ar-SA,en-US")
+    return {
+        "ok": True,
+        "text": result.get("text", ""),
+        "words": result.get("words", []),
+        "dialect": result.get("dialect", ""),
+        "review_priority": "high" if result.get("dialect_detected") else "normal",
+    }
+
+
+def _parse_reason(message: str) -> dict:
+    m = REASON_RE.search(message)
+    if not m:
+        return {"reason": "unknown", "retryable": False}
+    return {"reason": m.group(1), "retryable": m.group(2) == "True"}
+```
+
+### Failure-reason branching for the audio job pipeline
+
+Branch on the reason slug — auth/config problems never requeue, transient ones do:
+
+| Reason | Retryable | Job-pipeline action |
+|---|---|---|
+| `azure_auth`, `azure_not_configured`, `azure_sdk_missing` | no | dead-letter; page on-call (credential/deployment issue) |
+| `azure_bad_request`, `invalid_audio`, `azure_invalid_response` | no | dead-letter; inspect the job payload |
+| `azure_unreachable`, `azure_timeout`, `azure_service` | yes | requeue with backoff |
+| `azure_rate_limited` | yes | requeue with longer backoff (429) |
+
+The daemon already retries internally (0.5/1/2 s backoff, retryable reasons
+only); the slug reaching your app means the retries were exhausted. Metrics:
+`cloud_requests_total{engine,kind}` / `cloud_errors_total{engine,kind,reason}`
+on `/metrics`.
+
+### Read-aloud TTS
+
+```python
+async def read_aloud(rpc: SpeechRpc, text: str, voice: str = "") -> bytes:
+    params = {"text": text, "engine": "azure"}
+    if voice:
+        params["voice"] = voice  # e.g. "ar-EG-SalmaNeural"
+    resp = await rpc.call("speech.synthesize", params)
+    if "error" in resp:
+        raise RuntimeError(resp["error"]["message"])
+    return base64.b64decode(resp["result"]["audio"])  # 16 kHz mono WAV
+```
+
+Cloud engines also work in realtime paths: a WS voice session `start` frame
+accepts `asr_engine`/`tts_engine` (e.g. `"azure"`), and the ensuing
+`speech.asr` `final` frames carry the same `engine`/`words`/`dialect`/
+`dialect_detected` fields. Set up the daemon with
+`pip install -e ".[azure]"` plus the credential env vars; without them the
+daemon stays local-only (fail-soft) and `speech.engines` lists just `local`.

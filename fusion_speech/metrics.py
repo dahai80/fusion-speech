@@ -158,6 +158,15 @@ class MetricsRegistry:
         self.tts_queue_overflow_total = _Counter(
             "tts_queue_overflow_total", "Total speak frames dropped from a full per-session TTS queue (issue #3)."
         )
+        # Issue #4: cloud engine calls. `reason` is the stable CloudEngineError
+        # slug (azure_auth / azure_unreachable / ...) so the exam pipeline can
+        # alert on auth drift vs. transient transport separately.
+        self.cloud_requests_total = _Counter(
+            "cloud_requests_total", "Total cloud engine inference requests.", ("engine", "kind")
+        )
+        self.cloud_errors_total = _Counter(
+            "cloud_errors_total", "Total cloud engine request failures.", ("engine", "kind", "reason")
+        )
 
     def uptime_seconds(self) -> float:
         return time.time() - self.start_time
@@ -236,6 +245,8 @@ def render_prometheus() -> str:
     emit_gauge(reg.sessions)
     emit_counter(reg.barge_in_total)
     emit_counter(reg.tts_queue_overflow_total)
+    emit_counter(reg.cloud_requests_total)
+    emit_counter(reg.cloud_errors_total)
     lines.append("# HELP uptime_seconds Daemon uptime in seconds.")
     lines.append("# TYPE uptime_seconds gauge")
     lines.append(f"uptime_seconds {reg.uptime_seconds()}")

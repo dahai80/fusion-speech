@@ -209,7 +209,7 @@ class WsIngressSession:
         if self.daemon.asr.listener is not None and self.daemon.asr.listener.active:
             raise RuntimeError("ASR already active (mic listening or another WS session); one stream at a time")
         metrics.sessions.inc(1)
-        await self.daemon.asr.start_listening(audio_source=self.source)
+        await self.daemon.asr.start_listening(audio_source=self.source, engine=self.asr_engine_name)
         await self.session.start()
         self._started = True
         self._pump_queue = self.daemon.subscribe()
@@ -428,7 +428,7 @@ class WsIngressSession:
             await self.session.end_speak(cancelled=cancelled)
             if stopped_asr and not self._stopping:
                 with contextlib.suppress(Exception):
-                    await self.daemon.asr.start_listening(audio_source=self.source)
+                    await self.daemon.asr.start_listening(audio_source=self.source, engine=self.asr_engine_name)
         # else: more sentences queued — stay in speaking, worker loops
 
     async def cancel_tts(self) -> dict:

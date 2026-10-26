@@ -58,9 +58,13 @@ async def handle_transcribe(params: dict, daemon) -> dict:
         raise ValueError(f"audio too large: {len(audio_b64)} > {MAX_AUDIO_B64} bytes")
     audio_bytes = base64.b64decode(audio_b64)
     language = params.get("language", "") or daemon.config.language
+    engine = params.get("engine", "") or "local"
+    if engine != "local":
+        logger.info("speech.transcribe bytes=%d engine=%s", len(audio_bytes), engine)
+        return await _cloud_transcribe(daemon, engine, audio_bytes, language)
     model = params.get("model", "") or _resolve_stt_model(daemon)
     filename = params.get("filename", "audio.wav")
-    logger.info("speech.transcribe bytes=%d model=%s", len(audio_bytes), model)
+    logger.info("speech.transcribe bytes=%d engine=%s model=%s", len(audio_bytes), engine, model)
     result = await transcribe_stream(
         daemon.config,
         audio_bytes,
@@ -71,16 +75,53 @@ async def handle_transcribe(params: dict, daemon) -> dict:
     return result
 
 
+async def _cloud_transcribe(daemon, engine: str, audio_bytes: bytes, language: str) -> dict:
+    # Issue #4: route through the engine registry. CloudEngineError carries a
+    # stable reason slug in its message (JSON-RPC errors are message-only), so
+    # the audio job pipeline can branch on azure_auth vs azure_unreachable.
+    from fusion_speech.cloud import CloudEngineError
+    from fusion_speech.engines import AsrEngineError, make_asr_engine
+
+    try:
+        asr = make_asr_engine(engine, daemon.config)
+        return await asr.transcribe_wav(audio_bytes, language=language)
+    except (CloudEngineError, AsrEngineError) as e:
+        logger.error("speech.transcribe engine=%s failed: %s", engine, e)
+        raise ValueError(str(e)) from e
+
+
 async def handle_synthesize(params: dict, daemon) -> dict:
     text = params.get("text", "")
     if not text:
         raise ValueError("text required")
     if len(text) > MAX_TEXT:
         raise ValueError(f"text too long: {len(text)} > {MAX_TEXT} chars")
-    voice = params.get("voice", "") or daemon.config.tts_voice
+    voice = params.get("voice", "")
+    engine = params.get("engine", "") or "local"
+    if engine != "local":
+        logger.info("speech.synthesize chars=%d engine=%s", len(text), engine)
+        return await _cloud_synthesize(daemon, engine, text, voice)
+    voice = voice or daemon.config.tts_voice
     model = params.get("model", "") or _resolve_tts_model(daemon)
-    logger.info("speech.synthesize chars=%d model=%s", len(text), model)
+    logger.info("speech.synthesize chars=%d engine=%s model=%s", len(text), engine, model)
     wav_bytes = await synthesize_full(daemon.config, text, voice=voice, model=model)
+    return {"audio": base64.b64encode(wav_bytes).decode("ascii"), "format": "wav", "size": len(wav_bytes)}
+
+
+async def _cloud_synthesize(daemon, engine: str, text: str, voice: str) -> dict:
+    from fusion_speech.cloud import CloudEngineError
+    from fusion_speech.engines import AsrEngineError, make_tts_engine
+
+    try:
+        tts = make_tts_engine(engine, daemon.config)
+        wav_chunks: list[bytes] = []
+        stream = tts.synthesize(text, voice=voice)
+        async for chunk in stream:
+            wav_chunks.append(chunk)
+    except (CloudEngineError, AsrEngineError) as e:
+        logger.error("speech.synthesize engine=%s failed: %s", engine, e)
+        raise ValueError(str(e)) from e
+    wav_bytes = b"".join(wav_chunks)
     return {"audio": base64.b64encode(wav_bytes).decode("ascii"), "format": "wav", "size": len(wav_bytes)}
 
 
@@ -167,12 +208,24 @@ async def handle_reprobe(params: dict, daemon) -> dict:
     return {"audio_lane": lane}
 
 
+async def handle_engines(params: dict, daemon) -> dict:
+    # Issue #4: advertise registered engines so clients can feature-detect
+    # cloud availability (azure appears only when credentials are configured).
+    from fusion_speech.engines import registered_asr_engines, registered_tts_engines
+
+    asr = registered_asr_engines()
+    tts = registered_tts_engines()
+    logger.debug("speech.engines asr=%s tts=%s", asr, tts)
+    return {"asr": asr, "tts": tts}
+
+
 def build_methods(daemon) -> dict:
     return {
         "speech.ping": lambda params: handle_ping(params, daemon),
         "speech.status": lambda params: handle_status(params, daemon),
         "speech.transcribe": lambda params: handle_transcribe(params, daemon),
         "speech.synthesize": lambda params: handle_synthesize(params, daemon),
+        "speech.engines": lambda params: handle_engines(params, daemon),
         "speech.list_models": lambda params: handle_list_models(params, daemon),
         "speech.start_listening": lambda params: handle_start_listening(params, daemon),
         "speech.stop_listening": lambda params: handle_stop_listening(params, daemon),

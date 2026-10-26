@@ -115,6 +115,11 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_BARGE_IN` | `1` | default barge-in armed for full-duplex sessions |
 | `FUSION_SPEECH_REPROMPT_CONFIDENCE` | `0.0` | ASR finals with confidence below this emit `speech.reprompt` (0 = disabled; empty transcripts always reprompt) |
 | `FUSION_SPEECH_TTS_QUEUE_MAX` | `8` | per-session speak-frame queue depth; overflow drops the oldest frame and emits `speech.queue_overflow` |
+| `FUSION_SPEECH_AZURE_KEY` | (empty) | Azure Speech subscription key (fusion-identity issued; unset = cloud engines stay unregistered) |
+| `FUSION_SPEECH_AZURE_REGION` | (empty) | Azure region (e.g. `eastus`) |
+| `FUSION_SPEECH_AZURE_LANGUAGE` | `en-US` | default Azure STT language when no LID candidates |
+| `FUSION_SPEECH_AZURE_STT_LANGUAGES` | (empty) | comma-separated LID candidate list (e.g. `ar-EG,ar-SA,en-US`); enables dialect detection |
+| `FUSION_SPEECH_AZURE_TTS_VOICE` | `en-US-AriaNeural` | default Azure TTS voice |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
@@ -127,9 +132,10 @@ JSON-RPC 2.0 over UDS, newline-delimited. Peer UID verified (fail-closed).
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp}` |
 | `speech.status` | `{}` | running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords |
-| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
-| `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
+| `speech.transcribe` | `{audio: base64, language?, model?, filename?, engine?}` | `{text, language, duration, segments?, engine?, words?, dialect?, dialect_detected?}` |
+| `speech.synthesize` | `{text, voice?, model?, engine?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
+| `speech.engines` | `{}` | `{asr: [...], tts: [...]}` — registered engine names (local + cloud) |
 | `speech.start_listening` | `{}` | `{listening: true}` — arms mic capture + streaming ASR |
 | `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
 | `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` — register wake words (pretrained names only; unknown dropped) |
@@ -226,6 +232,37 @@ them on `/v1/audio/speech` yet, upstream issue dahai80/fusion-mlx#1339). Cloud
 engines (e.g. iFlytek WS) register via `register_asr_engine` /
 `register_tts_engine` and are selected per session by name — no fork needed.
 
+## Cloud Engines (issue #4)
+
+Pluggable cloud STT/TTS on the same engine registry, first implementation:
+**Azure AI Speech** (`pip install -e ".[azure]"`). Credentials never live in
+business apps — the daemon holds them (env `FUSION_SPEECH_AZURE_KEY` /
+`_REGION`, issued via fusion-identity) and business clients select the engine
+by name (`engine: "azure"` on `speech.transcribe`/`speech.synthesize`, or
+`asr_engine`/`tts_engine` on a voice session `start`). Engines register at
+startup only when both env vars are set (fail-soft: unset = local-only daemon);
+a `credentials` provider hook is available for embedding-side key rotation.
+
+- **Azure STT** — SDK push-stream + one-shot recognize (word alignment and
+  language ID are SDK-only features; the short-audio REST API returns neither).
+  Returns word-level timestamps (`words`: word/offset_ms/duration_ms/confidence,
+  100 ns ticks converted) and dialect detection (`dialect`, e.g. `ar-EG`) when
+  LID candidates are configured via `FUSION_SPEECH_AZURE_STT_LANGUAGES` — the
+  ai-speech-exam accent flag that raises human-review priority. SDK calls run
+  in a worker thread; retry rebuilds the recognizer from the retained PCM.
+- **Azure TTS** — REST SSML POST, `riff-16khz-16bit-mono-pcm` output (the
+  daemon 16 kHz mono contract, no resampling), streamed chunk by chunk. Retry
+  covers the connection open only — mid-stream replay would duplicate playback.
+- **Failure reasons for the audio job pipeline** — errors carry a stable slug
+  (`azure_auth`, `azure_unreachable`, `azure_rate_limited`, `azure_service`,
+  `azure_timeout`, `azure_sdk_missing`, `azure_invalid_response`,
+  `azure_not_configured`, `invalid_audio`, `azure_bad_request`) embedded in the
+  JSON-RPC error message plus a retryable flag; auth/bad-request never requeue,
+  network/429 retry with 0.5/1/2 s backoff. Counters:
+  `cloud_requests_total{engine,kind}` / `cloud_errors_total{engine,kind,reason}`.
+- `speech.engines` lists the registered engines. Real-load gate:
+  `tests/test_cloud_real_load.py` (opt-in, skips without live Azure creds).
+
 ## Metrics
 
 `GET /metrics` on the HTTP port (`127.0.0.1:11465`) returns Prometheus text
@@ -250,6 +287,8 @@ report state gauges; the ASR/TTS bridges report throughput.
 | `sessions` | Gauge | — | current WS voice sessions |
 | `barge_in_total` | Counter | — | barge-in interruptions (VAD onset during playback) |
 | `tts_queue_overflow_total` | Counter | — | speak frames dropped from a full per-session TTS queue |
+| `cloud_requests_total` | Counter | `engine`, `kind` | cloud engine calls (kind = stt / tts) |
+| `cloud_errors_total` | Counter | `engine`, `kind`, `reason` | cloud engine errors by reason slug |
 
 `speech.status` also returns a metrics summary (`uptime`, `rpc_total`,
 `errors_total`). Scrape with:
@@ -288,11 +327,11 @@ Unit + adversarial gate suite run offline (no model load, no live daemon):
 ```bash
 cd /Users/dahai/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=dahai168 pytest tests/ -q          # 183 passed, 6 skipped
+FUSION_MLX_API_KEY=<key> pytest tests/ -q              # 215 passed, 7 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
-The 6 skipped tests carry the `real_load` marker — they start the real
+The 7 skipped tests carry the `real_load` marker — they start the real
 fusion-speech daemon (real port 11465 + real socket) backed by a real
 fusion-mlx on 11434, so they are opt-in. Set `FUSION_SPEECH_REAL_LOAD=1`
 (and have fusion-mlx up) to run them:
@@ -522,5 +561,12 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
   [`docs/INTEGRATION_GUIDE.md`](docs/INTEGRATION_GUIDE.md) and developer
   [`docs/CONTRIBUTING.md`](docs/CONTRIBUTING.md); patch over 0.1.0rc1. No runtime
   change. Known upstream limit: fusion-mlx issue #668 (STT 500) — see Testing.
+- **0.1.4** — pluggable cloud engines + Azure AI Speech (issue #4). See
+  [Cloud Engines](#cloud-engines-issue-4). `engine` param on
+  `speech.transcribe`/`speech.synthesize`, `asr_engine`/`tts_engine` on voice
+  sessions, new `speech.engines` RPC, word-level STT timestamps + dialect
+  detection, reason-slug failure reporting, `cloud_requests_total` /
+  `cloud_errors_total` metrics. Fail-soft: without Azure env vars the daemon
+  is unchanged, local-only.
 
 License: Apache-2.0.
