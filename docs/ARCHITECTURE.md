@@ -191,6 +191,39 @@ from `fusion_core.config.resolve_api_key()` (env `FUSION_MLX_API_KEY`, else
 `~/.fusion-mlx/settings.json` `auth.api_key`). Mismatched env vs settings causes
 401; the startup probe surfaces this as `audio_lane.error`.
 
+## 4a. Cloud Engine Layer (issue #4)
+
+`cloud.py` + `cloud_azure.py` extend the M7 engine registry with cloud STT/TTS.
+Same `ASREngine`/`TTSEngine` ABCs, so cloud engines slot into every existing
+consumer path (RPC `engine` param, voice-session `asr_engine`/`tts_engine`,
+mic pipeline via the injectable transcribe adapter).
+
+- **Credentials** — fetched per call from an async provider (`StaticCredentials`
+  wraps `FUSION_SPEECH_AZURE_KEY`/`_REGION` from config), so fusion-identity
+  rotation needs no restart. Business apps never see keys; they select an
+  engine by name. Registration is fail-soft: unset env vars = engines absent,
+  daemon local-only.
+- **Azure STT** — SDK push-stream + one-shot recognize in a worker thread
+  (`asyncio.to_thread`); SDK-only because word-level timestamps and language ID
+  are absent from the short-audio REST API. Detailed JSON (`NBest[0].Words`,
+  100 ns ticks → ms) and the LID locale (dialect, e.g. `ar-EG`) ride along in
+  the result dict and in `speech.asr` `final` frames. Retry rebuilds the
+  recognizer from the retained PCM buffer (push streams are not seekable).
+- **Azure TTS** — REST SSML POST (`X-Microsoft-OutputFormat:
+  riff-16khz-16bit-mono-pcm` = the 16 kHz mono contract, no resampling),
+  streamed chunk-wise; retry covers connection open only.
+- **Failure model** — `CloudEngineError(reason=<slug>, retryable=...)`; the slug
+  and flag are embedded in the message because JSON-RPC errors are
+  message-only. Auth/config/bad-request are non-retryable (dead-letter);
+  network/timeout/5xx/429 retry with 0.5/1/2 s backoff inside
+  `cloud_retry`, wrapped by `cloud_call` which counts
+  `cloud_requests_total{engine,kind}` / `cloud_errors_total{engine,kind,reason}`.
+- **Optional dep** — `pip install -e ".[azure]"`; a missing SDK import raises
+  `CloudEngineError(reason="azure_sdk_missing", retryable=False)` instead of
+  crashing the daemon. Real-load gate: `tests/test_cloud_real_load.py`
+  (module-level skip without live creds — flips to real assertions once
+  fusion-identity provisions them).
+
 ## 5. IPC Contract (UDS JSON-RPC)
 
 Newline-delimited JSON-RPC 2.0 over UDS. One JSON object per line, UTF-8.

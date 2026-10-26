@@ -106,6 +106,11 @@ asyncio.run(main())
 | `FUSION_SPEECH_WAKE_CHUNK_SAMPLES` | `1280` | 固定唤醒帧大小 —— 必须 1280（openwakeword 80ms 契约）；非 1280 启动失败 |
 | `FUSION_SPEECH_PROBE_INTERVAL_S` | `60.0` | 后台音频通道重探间隔（秒） |
 | `FUSION_SPEECH_TTS_QUEUE_MAX` | `8` | 每会话 speak 帧排队深度；溢出丢最旧一帧并发 `speech.queue_overflow` |
+| `FUSION_SPEECH_AZURE_KEY` | （空） | Azure Speech 订阅 key（fusion-identity 签发；未设 = 云引擎不注册） |
+| `FUSION_SPEECH_AZURE_REGION` | （空） | Azure 区域（如 `eastus`） |
+| `FUSION_SPEECH_AZURE_LANGUAGE` | `en-US` | 无 LID 候选时的默认 Azure STT 语言 |
+| `FUSION_SPEECH_AZURE_STT_LANGUAGES` | （空） | 逗号分隔 LID 候选列表（如 `ar-EG,ar-SA,en-US`）；启用方言检测 |
+| `FUSION_SPEECH_AZURE_TTS_VOICE` | `en-US-AriaNeural` | 默认 Azure TTS 音色 |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | 日志级别 |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | 日志目录 |
 | `FUSION_MLX_API_KEY` | （来自 settings.json） | fusion-mlx bearer key |
@@ -118,9 +123,10 @@ asyncio.run(main())
 |---|---|---|
 | `speech.ping` | `{}` | `{pong: true, timestamp}` |
 | `speech.status` | `{}` | running, socket_path, port, uptime, mlx_audio_lane, stt_model, tts_model, listening, hotwords |
-| `speech.transcribe` | `{audio: base64, language?, model?, filename?}` | `{text, language, duration, segments?}` |
-| `speech.synthesize` | `{text, voice?, model?}` | `{audio: base64 wav, format: "wav", size}` |
+| `speech.transcribe` | `{audio: base64, language?, model?, filename?, engine?}` | `{text, language, duration, segments?, engine?, words?, dialect?, dialect_detected?}` |
+| `speech.synthesize` | `{text, voice?, model?, engine?}` | `{audio: base64 wav, format: "wav", size}` |
 | `speech.list_models` | `{}` | `{total, audio_models}` |
+| `speech.engines` | `{}` | `{asr: [...], tts: [...]}` —— 已注册引擎名（本地 + 云） |
 | `speech.start_listening` | `{}` | `{listening: true}` —— 激活麦克风采集 + 流式 ASR |
 | `speech.stop_listening` | `{}` | `{listening: false, segments: <int>}` |
 | `speech.set_hotwords` | `{hotwords: [...]}` | `{hotwords: [...]}` —— 注册唤醒词（仅预训练名；未知词丢弃） |
@@ -160,6 +166,34 @@ fusion-mlx 模型集中，回退到该模态首个被探测的音频模型（WAR
 错误码遵循 JSON-RPC 2.0：`-32700` 解析错误、`-32600` 非法请求、`-32601` 方法未找到、
 `-32603` 内部错误、`-32000` handler 错误。
 
+## 云引擎（issue #4）
+
+同一引擎注册表上的可插拔云 STT/TTS，首个实现：**Azure AI Speech**
+（`pip install -e ".[azure]"`）。凭证永不在业务应用中 —— 守护进程持有
+（环境变量 `FUSION_SPEECH_AZURE_KEY` / `_REGION`，经 fusion-identity 签发），
+业务客户端按名选引擎（`speech.transcribe`/`speech.synthesize` 传
+`engine: "azure"`，或语音会话 `start` 传 `asr_engine`/`tts_engine`）。两个
+环境变量都设置时启动才注册（fail-soft：未设 = 纯本地守护进程）；另有
+`credentials` provider 钩子供嵌入侧密钥轮换。
+
+- **Azure STT** —— SDK push-stream + 一次性识别（词级对齐与语言 ID 是
+  SDK 独有特性；短音频 REST API 两者都不返回）。返回词级时间戳
+  （`words`：word/offset_ms/duration_ms/confidence，100 ns tick 换算）与
+  方言检测（`dialect`，如 `ar-EG`，需经 `FUSION_SPEECH_AZURE_STT_LANGUAGES`
+  配置 LID 候选）—— ai-speech-exam 口音标记，用于提升人工复核优先级。
+  SDK 调用跑在工作线程；重试用保留的 PCM 重建识别器。
+- **Azure TTS** —— REST SSML POST，输出 `riff-16khz-16bit-mono-pcm`
+  （守护进程 16 kHz 单声道契约，免重采样），逐块流式。重试仅覆盖连接建立 ——
+  流中重放会导致重复播放。
+- **面向音频作业管线的失败原因** —— 错误带稳定 slug（`azure_auth`、
+  `azure_unreachable`、`azure_rate_limited`、`azure_service`、`azure_timeout`、
+  `azure_sdk_missing`、`azure_invalid_response`、`azure_not_configured`、
+  `invalid_audio`、`azure_bad_request`），嵌入 JSON-RPC 错误消息并带
+  retryable 标志；鉴权/bad-request 永不重排队，网络/429 按 0.5/1/2 s 退避重试。
+  计数器：`cloud_requests_total{engine,kind}` / `cloud_errors_total{engine,kind,reason}`。
+- `speech.engines` 列出已注册引擎。Real-load 门禁：`tests/test_cloud_real_load.py`
+  （可选，无真实 Azure 凭证时跳过）。
+
 ## 指标
 
 HTTP 端口（`127.0.0.1:11465`）上的 `GET /metrics` 返回 Prometheus 文本格式
@@ -181,6 +215,8 @@ HTTP 端口（`127.0.0.1:11465`）上的 `GET /metrics` 返回 Prometheus 文本
 | `wake_armed` | Gauge | — | 唤醒引擎激活时为 1，否则 0 |
 | `speaking` | Gauge | — | TTS 播放器激活时为 1，否则 0 |
 | `tts_queue_overflow_total` | Counter | — | 会话 TTS 队列满时丢弃的 speak 帧数 |
+| `cloud_requests_total` | Counter | `engine`, `kind` | 云引擎调用数（kind = stt / tts） |
+| `cloud_errors_total` | Counter | `engine`, `kind`, `reason` | 按原因 slug 的云引擎错误数 |
 
 `speech.status` 也返回指标摘要（`uptime`、`rpc_total`、`errors_total`）。抓取方式：
 

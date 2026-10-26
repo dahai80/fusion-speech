@@ -35,6 +35,8 @@ DEFAULT_WS_MAX_FRAME_BYTES = 65536
 DEFAULT_BARGE_IN = True
 DEFAULT_REPROMPT_CONFIDENCE = 0.0
 DEFAULT_TTS_QUEUE_MAX = 8
+DEFAULT_AZURE_LANGUAGE = "en-US"
+DEFAULT_AZURE_TTS_VOICE = "en-US-AriaNeural"
 REQUIRED_SAMPLE_RATE = 16000
 REQUIRED_CHANNELS = 1
 REQUIRED_WAKE_CHUNK = 1280
@@ -134,6 +136,22 @@ class SpeechConfig:
     # speech.queue_overflow so downstream can decide to skip.
     tts_queue_max: int = field(default_factory=lambda: _env_int("FUSION_SPEECH_TTS_QUEUE_MAX", DEFAULT_TTS_QUEUE_MAX))
     tts_output_device: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
+    # Issue #4: Azure AI Speech cloud engines. Empty key/region keeps azure
+    # unregistered (fail-soft — local engine stays the default); real values
+    # come from fusion-identity issuance, never a committed .env.
+    azure_key: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_KEY", "").strip())
+    azure_region: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_REGION", "").strip())
+    azure_language: str = field(
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_LANGUAGE", DEFAULT_AZURE_LANGUAGE)
+    )
+    # Comma-separated LID candidates (e.g. "ar-EG,ar-SA,en-US"). Non-empty
+    # enables language ID — the exam pipeline's dialect flag depends on it.
+    azure_stt_languages: str = field(
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_STT_LANGUAGES", "").strip()
+    )
+    azure_tts_voice: str = field(
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_TTS_VOICE", DEFAULT_AZURE_TTS_VOICE)
+    )
     log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
         default_factory=lambda: os.path.expanduser(os.environ.get("FUSION_SPEECH_LOG_DIR", "~/.fusion-speech/logs"))

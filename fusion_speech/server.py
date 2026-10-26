@@ -48,6 +48,16 @@ class SpeechDaemon:
         self._app: FastAPI | None = None
         self._http_task: asyncio.Task | None = None
         self._dispatcher = JsonRpcDispatcher(build_methods(self))
+        # Issue #4: auto-register azure cloud engines when credentials are
+        # provisioned (env-config path; keys issued via fusion-identity, never
+        # committed). Fail-soft — absent creds keep the local engine default.
+        if self.config.azure_key and self.config.azure_region:
+            with contextlib.suppress(Exception):
+                from fusion_speech.cloud_azure import register_azure_engines
+
+                register_azure_engines()
+        else:
+            logger.info("azure credentials not configured, cloud engines stay unregistered")
         # Wave 2: five leaf services + facade. Services hold single-resource
         # state; facade holds orchestration + lifecycle only. Property
         # delegation keeps test patches landing on facade delegators.

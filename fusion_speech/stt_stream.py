@@ -260,16 +260,20 @@ class StreamingListener:
         metrics.asr_transcribe_seconds.observe(time.monotonic() - t0)
         text = (result.get("text") or "").strip()
         logger.info("segment %d final: %r", seq, text[:120])
-        await self._notify(
-            {
-                "event": "speech.asr",
-                "state": "final",
-                "seq": seq,
-                "text": text,
-                "language": result.get("language", ""),
-                "duration": result.get("duration"),
-            }
-        )
+        final = {
+            "event": "speech.asr",
+            "state": "final",
+            "seq": seq,
+            "text": text,
+            "language": result.get("language", ""),
+            "duration": result.get("duration"),
+        }
+        # Issue #4: cloud engines append alignment + dialect metadata. Forward
+        # only when present so local-engine events keep their exact shape.
+        for key in ("engine", "words", "dialect", "dialect_detected"):
+            if result.get(key) is not None:
+                final[key] = result[key]
+        await self._notify(final)
 
     def _collect_pcm(self, segment: VadSegment) -> np.ndarray:
         # Slice from the drain-mirrored _capture (onset marked by _on_open),
