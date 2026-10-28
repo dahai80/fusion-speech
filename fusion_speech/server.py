@@ -630,8 +630,22 @@ class SpeechDaemon:
         await self.stop()
 
 
+def _set_process_title(port: int) -> None:
+    # Issue #5: bare homebrew "Python" in ps/Activity Monitor is unidentifiable.
+    # setproctitle is the only reliable way on macOS (exec -a is overwritten by
+    # the Python.app argv — see fusion-k12-teacher cli.py). Optional dep: missing
+    # package just keeps the default title, the daemon runs unchanged.
+    try:
+        import setproctitle
+
+        setproctitle.setproctitle(f"fusion-speech server :{port}")
+    except Exception:
+        logger.warning("setproctitle unavailable, process title stays default", exc_info=True)
+
+
 def main() -> None:
     cfg = load_config()
+    _set_process_title(cfg.port)
     setup_logging("fusion_speech", level=cfg.log_level, log_file=os.path.join(cfg.log_dir, "daemon.log"))
     daemon = SpeechDaemon(cfg)
     try:

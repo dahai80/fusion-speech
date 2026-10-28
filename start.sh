@@ -26,7 +26,10 @@ _pid_is_daemon() {
     cmd="$(ps -p "$pid" -o command= 2>/dev/null || true)"
     [ -n "$cmd" ] || return 1
     case "$cmd" in
-        *fusion_speech.server*) return 0 ;;
+        # setproctitle (issue #5) renames the live process to
+        # "fusion-speech server :PORT"; during the brief pre-rename startup
+        # window the raw python -m cmdline still shows. Match both.
+        *fusion-speech\ server*|*fusion_speech.server*) return 0 ;;
         *) return 1 ;;
     esac
 }
