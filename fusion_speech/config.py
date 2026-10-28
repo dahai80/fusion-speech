@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import os
 from dataclasses import dataclass, field
+from pathlib import Path
 
 from fusion_core import config as _core_config
 
@@ -43,47 +44,54 @@ REQUIRED_WAKE_CHUNK = 1280
 
 
 def _env_int(key: str, default: int) -> int:
-    raw = os.environ.get(key, "").strip()
-    try:
-        return int(raw) if raw else default
-    except ValueError:
-        logger.warning("config: %s=%r not int, fallback default %d", key, raw, default)
-        return default
+    # Thin alias over the fusion-core single-point resolver (issue #6): local
+    # resolvers are forbidden (config-conventions §2) — cast/warn semantics
+    # live in fusion_core.config only.
+    return _core_config.get_env(key, default, cast=int)
 
 
 def _env_float(key: str, default: float) -> float:
-    raw = os.environ.get(key, "").strip()
-    try:
-        return float(raw) if raw else default
-    except ValueError:
-        logger.warning("config: %s=%r not float, fallback default %s", key, raw, default)
-        return default
+    return _core_config.get_env(key, default, cast=float)
 
 
 def _env_bool(key: str, default: bool) -> bool:
-    raw = os.environ.get(key, "").strip().lower()
-    if not raw:
-        return default
-    return raw in ("1", "true", "yes", "on")
+    return _core_config.get_env(key, default, cast=bool)
+
+
+def _env_str(key: str, default: str) -> str:
+    return _core_config.get_env(key, default)
+
+
+def _data_dir() -> Path:
+    # service_data_dir honors FUSION_SPEECH_DATA_DIR; the explicit default
+    # keeps the long-standing ~/.fusion-speech layout (state, socket, logs —
+    # referenced by port-registry and docs) instead of the ~/.speech generic.
+    # Short app name ("speech", not "fusion-speech") — the helper prepends
+    # the prefix itself; passing the full name builds the banned doubled
+    # concat pattern (config-conventions §2).
+    return _core_config.service_data_dir("speech", default=Path.home() / ".fusion-speech")
 
 
 @dataclass
 class SpeechConfig:
-    port: int = field(default_factory=lambda: _env_int("FUSION_SPEECH_PORT", DEFAULT_PORT))
+    port: int = field(default_factory=lambda: _core_config.service_port("speech", default=DEFAULT_PORT))
     socket_path: str = field(default_factory=lambda: _resolve_socket_path())
     sample_rate: int = field(default_factory=lambda: _env_int("FUSION_SPEECH_SAMPLE_RATE", DEFAULT_SAMPLE_RATE))
     channels: int = 1
-    stt_model: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_STT_MODEL", DEFAULT_STT_MODEL))
-    tts_model: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_MODEL", DEFAULT_TTS_MODEL))
-    tts_voice: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_VOICE", DEFAULT_TTS_VOICE))
-    language: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LANGUAGE", DEFAULT_LANGUAGE))
+    stt_model: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_STT_MODEL", DEFAULT_STT_MODEL))
+    tts_model: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_TTS_MODEL", DEFAULT_TTS_MODEL))
+    tts_voice: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_TTS_VOICE", DEFAULT_TTS_VOICE))
+    language: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_LANGUAGE", DEFAULT_LANGUAGE))
     mlx_base_url: str = field(default_factory=lambda: _core_config.default_mlx_base_url())
-    mlx_api_key: str = field(default_factory=lambda: _core_config.resolve_api_key() or "")
+    # Issue #6: single-point key resolution (fusion-core#31). client_key honors
+    # the canonical client credential with the deprecated mlx-era names as
+    # alias chain; dev missing key = "" + warning, prod profile = RuntimeError.
+    mlx_api_key: str = field(default_factory=_core_config.client_key)
     vad_speech_threshold: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_VAD_THRESHOLD", VAD_SPEECH_THRESHOLD)
     )
     chunk_ms: int = field(default_factory=lambda: _env_int("FUSION_SPEECH_CHUNK_MS", CHUNK_MS))
-    wake_default_word: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_WAKE_WORD", DEFAULT_WAKE_WORD))
+    wake_default_word: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_WAKE_WORD", DEFAULT_WAKE_WORD))
     wake_threshold: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_WAKE_THRESHOLD", DEFAULT_WAKE_THRESHOLD)
     )
@@ -94,12 +102,10 @@ class SpeechConfig:
         default_factory=lambda: _env_float("FUSION_SPEECH_WAKE_DEBOUNCE_S", DEFAULT_WAKE_DEBOUNCE_S)
     )
     wake_model_dir: str = field(
-        default_factory=lambda: os.path.expanduser(
-            os.environ.get("FUSION_SPEECH_WAKE_MODEL_DIR", DEFAULT_WAKE_MODEL_DIR)
-        )
+        default_factory=lambda: os.path.expanduser(_env_str("FUSION_SPEECH_WAKE_MODEL_DIR", DEFAULT_WAKE_MODEL_DIR))
     )
     wake_model_url: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_WAKE_MODEL_URL", DEFAULT_WAKE_MODEL_URL)
+        default_factory=lambda: _env_str("FUSION_SPEECH_WAKE_MODEL_URL", DEFAULT_WAKE_MODEL_URL)
     )
     tts_playback_buffer_s: float = field(
         default_factory=lambda: _env_float("FUSION_SPEECH_TTS_BUFFER_S", DEFAULT_TTS_BUFFER_S)
@@ -120,9 +126,7 @@ class SpeechConfig:
     # the HTTP port is localhost-bound; multi-tenant auth stays upstream
     # (fusion-identity / control plane) per the issue's non-goals.
     ws_ingress_enabled: bool = field(default_factory=lambda: _env_bool("FUSION_SPEECH_WS_INGRESS", DEFAULT_WS_INGRESS))
-    ws_ingress_token: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_WS_TOKEN", DEFAULT_WS_TOKEN).strip()
-    )
+    ws_ingress_token: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_WS_TOKEN", DEFAULT_WS_TOKEN).strip())
     ws_max_frame_bytes: int = field(
         default_factory=lambda: _env_int("FUSION_SPEECH_WS_MAX_FRAME", DEFAULT_WS_MAX_FRAME_BYTES)
     )
@@ -135,26 +139,24 @@ class SpeechConfig:
     # sentence (the tail is the newest, most relevant one) and emits
     # speech.queue_overflow so downstream can decide to skip.
     tts_queue_max: int = field(default_factory=lambda: _env_int("FUSION_SPEECH_TTS_QUEUE_MAX", DEFAULT_TTS_QUEUE_MAX))
-    tts_output_device: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
+    tts_output_device: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_TTS_OUTPUT_DEVICE", ""))
     # Issue #4: Azure AI Speech cloud engines. Empty key/region keeps azure
     # unregistered (fail-soft — local engine stays the default); real values
     # come from fusion-identity issuance, never a committed .env.
-    azure_key: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_KEY", "").strip())
-    azure_region: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_REGION", "").strip())
+    azure_key: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_AZURE_KEY", "").strip())
+    azure_region: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_AZURE_REGION", "").strip())
     azure_language: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_LANGUAGE", DEFAULT_AZURE_LANGUAGE)
+        default_factory=lambda: _env_str("FUSION_SPEECH_AZURE_LANGUAGE", DEFAULT_AZURE_LANGUAGE)
     )
     # Comma-separated LID candidates (e.g. "ar-EG,ar-SA,en-US"). Non-empty
     # enables language ID — the exam pipeline's dialect flag depends on it.
-    azure_stt_languages: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_STT_LANGUAGES", "").strip()
-    )
+    azure_stt_languages: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_AZURE_STT_LANGUAGES", "").strip())
     azure_tts_voice: str = field(
-        default_factory=lambda: os.environ.get("FUSION_SPEECH_AZURE_TTS_VOICE", DEFAULT_AZURE_TTS_VOICE)
+        default_factory=lambda: _env_str("FUSION_SPEECH_AZURE_TTS_VOICE", DEFAULT_AZURE_TTS_VOICE)
     )
-    log_level: str = field(default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
+    log_level: str = field(default_factory=lambda: _env_str("FUSION_SPEECH_LOG_LEVEL", "INFO").upper())
     log_dir: str = field(
-        default_factory=lambda: os.path.expanduser(os.environ.get("FUSION_SPEECH_LOG_DIR", "~/.fusion-speech/logs"))
+        default_factory=lambda: os.environ.get("FUSION_SPEECH_LOG_DIR", "").strip() or str(_data_dir() / "logs")
     )
 
     def __post_init__(self) -> None:
@@ -204,9 +206,11 @@ class SpeechConfig:
 
 
 def _resolve_socket_path() -> str:
+    # FUSION_SOCKET_DIR override wins (tests isolate via tmp dirs); default
+    # derives from the single-point service_data_dir (issue #6).
     socket_dir = os.environ.get("FUSION_SOCKET_DIR", "").strip()
     if not socket_dir:
-        socket_dir = os.path.expanduser("~/.fusion-speech/run")
+        socket_dir = str(_data_dir() / "run")
     socket_dir = os.path.expanduser(socket_dir)
     os.makedirs(socket_dir, mode=0o700, exist_ok=True)
     with contextlib.suppress(OSError):
