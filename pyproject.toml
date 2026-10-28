@@ -15,6 +15,7 @@ dependencies = [
     "pydantic",
     "numpy",
     "sounddevice",
+    "setproctitle",
 ]
 
 [project.optional-dependencies]
