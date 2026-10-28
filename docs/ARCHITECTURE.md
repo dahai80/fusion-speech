@@ -187,9 +187,11 @@ audio POSTs on top of `FusionMLXClient.client` (an `httpx.AsyncClient` with Bear
 auth), since `FusionMLXClient` itself has no audio methods.
 
 **Auth.** `FusionMLXClient` sends `Authorization: Bearer <key>`. The key resolves
-from `fusion_core.config.resolve_api_key()` (env `FUSION_MLX_API_KEY`, else
-`~/.fusion-mlx/settings.json` `auth.api_key`). Mismatched env vs settings causes
-401; the startup probe surfaces this as `audio_lane.error`.
+from `fusion_core.config.client_key()` (env `FUSION_CLIENT_KEY`, with the
+deprecated `FUSION_MLX_API_KEY` honored as alias — issue #6 single-point
+resolution). Dev missing key = "" + warning; `FUSION_PROFILE=prod` missing key =
+RuntimeError at startup. A stale/wrong key surfaces as 401; the startup probe
+reports this as `audio_lane.error`.
 
 ## 4a. Cloud Engine Layer (issue #4)
 
@@ -511,8 +513,8 @@ after merge.
 - **Peer-UID verification.** Every UDS connection is verified via `getsockopt`
   (`LOCAL_PEERCRED` on macOS, `SO_PEERCRED` on Linux). Different UID → dropped.
   `getsockopt` failure → dropped (fail-closed, never fail-open).
-- **Bearer auth to fusion-mlx.** API key from `fusion_core.config.resolve_api_key()`,
-  never logged. Env override `FUSION_MLX_API_KEY`.
+- **Bearer auth to fusion-mlx.** API key from `fusion_core.config.client_key()`,
+  never logged. Env: `FUSION_CLIENT_KEY` (deprecated alias `FUSION_MLX_API_KEY`).
 - **No secrets in logs.** Config logs the resolved base URL and model ids, never
   the API key.
 - **No network egress.** All inference stays on loopback to fusion-mlx.

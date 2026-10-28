@@ -113,7 +113,7 @@ asyncio.run(main())
 | `FUSION_SPEECH_AZURE_TTS_VOICE` | `en-US-AriaNeural` | 默认 Azure TTS 音色 |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | 日志级别 |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | 日志目录 |
-| `FUSION_MLX_API_KEY` | （来自 settings.json） | fusion-mlx bearer key |
+| `FUSION_CLIENT_KEY` | （仅环境变量） | fusion-mlx bearer key，经 `fusion_core.config.client_key` 单点解析（issue #6）；旧名 `FUSION_MLX_API_KEY` 仍作别名生效。开发环境缺 key = 空值 + 警告，`FUSION_PROFILE=prod` 缺 key = 启动报错 |
 
 ## RPC API
 
@@ -252,11 +252,11 @@ curl http://127.0.0.1:11465/metrics
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<your-key> pytest tests/ -q          # 183 passed, 6 skipped
+FUSION_MLX_API_KEY=<key> pytest tests/ -q             # 224 passed, 7 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
-5 个 skipped 测试带 `real_load` 标记 —— 它们启动真实 fusion-speech 守护进程
+7 个 skipped 测试带 `real_load` 标记 —— 它们启动真实 fusion-speech 守护进程
 （真实端口 11465 + 真实 socket），背后是真实 fusion-mlx（11434），故为可选。设
 `FUSION_SPEECH_REAL_LOAD=1`（并确保 fusion-mlx 已起）来运行：
 
@@ -266,7 +266,7 @@ FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=<your-key> \
   pytest tests/test_m6_real_load_integration.py -m real_load -v
 ```
 
-real-load 套件是基于 UDS JSON-RPC 的 5 步全链路门禁：
+real-load 套件是基于 UDS JSON-RPC 的 6 步全链路门禁：
 
 1. `speech.ping`/`speech.status` —— 存活 + 音频通道已探测。
 2. `speech.transcribe` —— 经 fusion-mlx 对内置英文 fixture 做真实 STT。**上游

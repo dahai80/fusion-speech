@@ -175,7 +175,7 @@ class WakeWordEngine:
         try:
             loop = asyncio.get_event_loop()
             await loop.run_in_executor(None, self._load_model)
-            self._score_keys = self._resolve_score_keys()
+            self._score_keys = self._match_score_keys()
             logger.info("wake score keys resolved: %s", self._score_keys)
         except Exception as e:
             logger.warning("wake engine unavailable, disabled: %s", e)
@@ -188,7 +188,7 @@ class WakeWordEngine:
         # is not blocked. _load_model sets self.enabled on success.
         loop = asyncio.get_event_loop()
         await loop.run_in_executor(None, self._load_model)
-        self._score_keys = self._resolve_score_keys()
+        self._score_keys = self._match_score_keys()
 
     def _load_model(self) -> None:
         if self._model_builder is not None:
@@ -253,7 +253,7 @@ class WakeWordEngine:
                 self._score_keys = prev_keys
                 raise WakeModelError(f"set_hotwords reload failed: {e}") from e
         else:
-            self._score_keys = self._resolve_score_keys()
+            self._score_keys = self._match_score_keys()
         return list(self.words)
 
     def pause(self) -> None:
@@ -396,7 +396,7 @@ class WakeWordEngine:
         if exc is not None:
             logger.error("wake on_wake task failed: %r", exc)
 
-    def _resolve_score_keys(self) -> dict[str, str]:
+    def _match_score_keys(self) -> dict[str, str]:
         # openwakeword.Model.predict() keys its score dict by the model name it
         # derives internally as splitext(basename(path))[0] — e.g. file
         # "hey_jarvis_v0.1.onnx" -> key "hey_jarvis_v0.1". Older code wrongly did

@@ -122,7 +122,7 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_AZURE_TTS_VOICE` | `en-US-AriaNeural` | default Azure TTS voice |
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
-| `FUSION_MLX_API_KEY` | (from settings.json) | fusion-mlx bearer key |
+| `FUSION_CLIENT_KEY` | (env only) | fusion-mlx bearer key via `fusion_core.config.client_key` (issue #6); legacy `FUSION_MLX_API_KEY` still honored as alias. Dev missing = empty + warning, `FUSION_PROFILE=prod` missing = startup error |
 
 ## RPC API
 
@@ -327,7 +327,7 @@ Unit + adversarial gate suite run offline (no model load, no live daemon):
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<key> pytest tests/ -q              # 215 passed, 7 skipped
+FUSION_MLX_API_KEY=<key> pytest tests/ -q              # 224 passed, 7 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
@@ -568,5 +568,12 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
   detection, reason-slug failure reporting, `cloud_requests_total` /
   `cloud_errors_total` metrics. Fail-soft: without Azure env vars the daemon
   is unchanged, local-only.
+- **0.1.5** — process title + config single-point resolution (issues #5, #6).
+  Daemon now shows as `fusion-speech server :11465` in `ps`/Activity Monitor
+  (setproctitle, new core dep, fail-soft fallback). API key / port / data dir
+  resolution migrated to `fusion_core.config` (`client_key`, `service_port`,
+  `service_data_dir`): `FUSION_CLIENT_KEY` canonical, `FUSION_MLX_API_KEY`
+  honored as deprecated alias, dev missing key = warning, `FUSION_PROFILE=prod`
+  missing key = startup error. No behavior change otherwise.
 
 License: Apache-2.0.
