@@ -44,6 +44,22 @@ is_running() {
 }
 
 do_start() {
+    # Config governance Phase 3.3 (issue #7): refuse to serve on a port that is
+    # not registered in architecture/port-registry.yaml — fail at start instead
+    # of being caught later by CI check-ports. FUSION_SKIP_REGISTRY_CHECK=1
+    # bypasses; missing registry file = warn + continue (standalone deploy).
+    # Runs before any state mutation (pid/lock/socket) so a refusal is clean.
+    SERVICE="fusion-speech"
+    REGISTRY="${FUSION_REGISTRY:-$HOME/fusion/architecture/port-registry.yaml}"
+    if [ ! -f "$REGISTRY" ]; then
+        echo "warn: port-registry.yaml not found at $REGISTRY — registry self-check skipped" >&2
+    elif ! grep -A3 "^  ${SERVICE}:" "$REGISTRY" 2>/dev/null | grep -q "port: $DEFAULT_PORT$"; then
+        if [ "${FUSION_SKIP_REGISTRY_CHECK:-}" != "1" ]; then
+            echo "port $DEFAULT_PORT for ${SERVICE} not registered in $REGISTRY — refusing to start" >&2
+            exit 1
+        fi
+        echo "warn: registry check bypassed (FUSION_SKIP_REGISTRY_CHECK=1)" >&2
+    fi
     if is_running; then
         echo "fusion-speech already running (pid $(cat "$PID_FILE"))"
         return 0
