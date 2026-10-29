@@ -114,6 +114,8 @@ asyncio.run(main())
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | 日志级别 |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | 日志目录 |
 | `FUSION_CLIENT_KEY` | （仅环境变量） | fusion-mlx bearer key，经 `fusion_core.config.client_key` 单点解析（issue #6）；旧名 `FUSION_MLX_API_KEY` 仍作别名生效。开发环境缺 key = 空值 + 警告，`FUSION_PROFILE=prod` 缺 key = 启动报错 |
+| `FUSION_REGISTRY` | `~/fusion/architecture/port-registry.yaml` | start.sh 注册自检（issue #7）使用的 port-registry 路径 |
+| `FUSION_SKIP_REGISTRY_CHECK` | （未设置） | `1` 跳过注册自检（否则端口未注册会拒绝启动） |
 
 ## RPC API
 
@@ -252,7 +254,7 @@ curl http://127.0.0.1:11465/metrics
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<key> pytest tests/ -q             # 224 passed, 7 skipped
+FUSION_MLX_API_KEY=<key> pytest tests/ -q             # 229 passed, 7 skipped
 ruff check fusion_speech tests                         # clean
 ```
 

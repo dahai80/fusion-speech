@@ -123,6 +123,8 @@ All config via environment variables (no config file). Defaults live in
 | `FUSION_SPEECH_LOG_LEVEL` | `INFO` | log level |
 | `FUSION_SPEECH_LOG_DIR` | `~/.fusion-speech/logs` | log directory |
 | `FUSION_CLIENT_KEY` | (env only) | fusion-mlx bearer key via `fusion_core.config.client_key` (issue #6); legacy `FUSION_MLX_API_KEY` still honored as alias. Dev missing = empty + warning, `FUSION_PROFILE=prod` missing = startup error |
+| `FUSION_REGISTRY` | `~/fusion/architecture/port-registry.yaml` | port-registry location for the start.sh self-check (issue #7) |
+| `FUSION_SKIP_REGISTRY_CHECK` | (unset) | `1` bypasses the registry self-check (unregistered port would otherwise refuse to start) |
 
 ## RPC API
 
@@ -327,7 +329,7 @@ Unit + adversarial gate suite run offline (no model load, no live daemon):
 ```bash
 cd ~/fusion && source .venv/bin/activate
 cd fusion-speech
-FUSION_MLX_API_KEY=<key> pytest tests/ -q              # 224 passed, 7 skipped
+FUSION_MLX_API_KEY=<key> pytest tests/ -q              # 229 passed, 7 skipped
 ruff check fusion_speech tests                         # clean
 ```
 
@@ -575,5 +577,9 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
   `service_data_dir`): `FUSION_CLIENT_KEY` canonical, `FUSION_MLX_API_KEY`
   honored as deprecated alias, dev missing key = warning, `FUSION_PROFILE=prod`
   missing key = startup error. No behavior change otherwise.
+- **0.1.6** — start.sh registry self-check (issue #7, config Phase 3.3). Start
+  refuses when port 11465 is missing/mismatched in
+  `architecture/port-registry.yaml`; `FUSION_SKIP_REGISTRY_CHECK=1` bypasses;
+  missing registry file = warn + continue (standalone deploy).
 
 License: Apache-2.0.
