@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "集成指南", en: "Integration Guide" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/INTEGRATION_GUIDE.md
+---
+
 # fusion-speech Integration Guide
 
 > Scenario-based recipes for integrating fusion-speech into a client app

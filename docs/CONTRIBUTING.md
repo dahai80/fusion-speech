@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "贡献指南", en: "Contributing Guide" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/CONTRIBUTING.md
+---
+
 # Contributing to fusion-speech
 
 > Developer setup, test, style, and the upstream issue→PR workflow.

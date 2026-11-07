@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "Claude Code 工作指引", en: "Claude Code Working Guide" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - CLAUDE.md
+---
+
 # CLAUDE.md
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
