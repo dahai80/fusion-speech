@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "M4 设计说明", en: "M4 Design Spec" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/superpowers/specs/2026-08-26-m4-streaming-tts-playback-design.md
+---
+
 # M4 — Streaming TTS Playback (design)
 
 Status: approved (2026-08-26). Owner: fusion-speech.
