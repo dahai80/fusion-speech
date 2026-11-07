@@ -9,7 +9,7 @@ audience: engineer
 status: draft
 version: 0.1.6
 updated: 2026-11-07
-owner: @dahai
+owner: "@dahai"
 source_of_truth:
   - fusion_speech
   - docs/architecture-design.md
