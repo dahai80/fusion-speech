@@ -7,7 +7,7 @@ doc_type: changelog
 title: { zh: "变更日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.1.6
+version: 0.1.7
 updated: 2026-11-07
 owner: @dahai
 source_of_truth:
@@ -24,9 +24,16 @@ Keep-a-Changelog format.
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-07
+
 ### Added
 - Adopted the fusion docs-system v1.1 contract (grid position app x service):
   `docs/product-page.md`, `docs/get-started.md`, `docs/api-reference.md`,
   `docs/config-reference.md`, `docs/architecture.md`, `docs/troubleshooting.md`,
   `CHANGELOG.md`, 12-key frontmatter on in-scope markdown, and CI validation
   via `ci/validate_docs.py` gating markdown PRs (`.github/workflows/docs.yml`).
+
+### Fixed
+- `tests/test_wake_word.py::test_r2_download_off_loop` now skips with a cited
+  reason when the optional `[audio]` extra is absent, instead of failing on the
+  real openwakeword cold-import path (env precondition, not a code defect).

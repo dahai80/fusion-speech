@@ -320,7 +320,17 @@ async def test_r2_download_off_loop():
 
     import time as _t
 
+    import pytest
+
     from fusion_speech import wake_word as ww
+
+    # The test exercises the real openwakeword cold-import path in _load_model
+    # (injected downloader, real import + real model build). Without the
+    # optional [audio] extra the import fails and load fail-softs before the
+    # downloader is called — env precondition, not a code defect. Skip citing it.
+    pytest.importorskip(
+        "openwakeword", reason='optional [audio] extra missing (pip install -e ".[audio]")'
+    )
 
     called = {"ensure": 0}
 
