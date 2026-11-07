@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/architecture-design
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "架构设计", en: "Architecture Design" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/architecture-design.md
+---
+
 # fusion-speech — Technical Architecture
 
 ## 1. Design Principle

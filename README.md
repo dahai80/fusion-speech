@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/readme
+product: fusion-speech
+class: app
+entry: service
+doc_type: readme
+title: { zh: "fusion-speech", en: "fusion-speech" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README.md
+---
+
 # fusion-speech
 
 > [English](README.md) | [中文](README_CN.md)
