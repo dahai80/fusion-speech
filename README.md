@@ -597,5 +597,8 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
   refuses when port 11465 is missing/mismatched in
   `architecture/port-registry.yaml`; `FUSION_SKIP_REGISTRY_CHECK=1` bypasses;
   missing registry file = warn + continue (standalone deploy).
+- **0.1.7** — fusion docs-system v1.1 adoption (PR #8): six-page docs set,
+  `CHANGELOG.md`, 12-key frontmatter + CI validation (`ci/validate_docs.py`).
+  Wake R2 download test now skips when the optional `[audio]` extra is absent.
 
 License: Apache-2.0.
