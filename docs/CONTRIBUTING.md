@@ -172,7 +172,7 @@ A PR must be `ruff check` clean. Run both before committing.
 
 ## 6. Architecture entry points
 
-Start with [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — the full layer breakdown,
+Start with [`docs/architecture.md`](architecture.md) — the full layer breakdown,
 the fusion-\* integration map (§10), security model (§11), and milestone plan
 (§12). §3a documents the component split.
 
