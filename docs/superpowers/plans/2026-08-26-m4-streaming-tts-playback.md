@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "M4 实施计划", en: "M4 Implementation Plan" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/superpowers/plans/2026-08-26-m4-streaming-tts-playback.md
+---
+
 # M4 Streaming TTS Playback Implementation Plan
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.

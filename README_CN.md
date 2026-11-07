@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/readme
+product: fusion-speech
+class: app
+entry: service
+doc_type: readme
+title: { zh: "fusion-speech 中文说明", en: "fusion-speech (Chinese)" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - README_CN.md
+---
+
 # fusion-speech
 
 > [中文](README_CN.md) | [English](README.md)
@@ -288,7 +304,7 @@ socket/端口）在 `tests/conftest.py`。
 
 ## 状态
 
-里程碑进度：
+阶段进度：
 
 - **M0** — 工程骨架（本发布）：守护进程、UDS JSON-RPC、fusion-mlx 音频通道探测、
   `/health`、`start.sh` 生命周期、单元测试。**done**

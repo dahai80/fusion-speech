@@ -1,3 +1,19 @@
+---
+doc_id: fusion-speech/guide
+product: fusion-speech
+class: app
+entry: service
+doc_type: guide
+title: { zh: "贡献指南", en: "Contributing Guide" }
+audience: engineer
+status: draft
+version: 0.1.6
+updated: 2026-11-07
+owner: @dahai
+source_of_truth:
+  - docs/CONTRIBUTING.md
+---
+
 # Contributing to fusion-speech
 
 > Developer setup, test, style, and the upstream issue→PR workflow.
@@ -156,7 +172,7 @@ A PR must be `ruff check` clean. Run both before committing.
 
 ## 6. Architecture entry points
 
-Start with [`docs/ARCHITECTURE.md`](ARCHITECTURE.md) — the full layer breakdown,
+Start with [`docs/architecture.md`](architecture.md) — the full layer breakdown,
 the fusion-\* integration map (§10), security model (§11), and milestone plan
 (§12). §3a documents the component split.
 
