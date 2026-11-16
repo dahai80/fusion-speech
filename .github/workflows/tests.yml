@@ -1,0 +1,48 @@
+name: tests
+
+on:
+  pull_request:
+    paths:
+      - "fusion_speech/**"
+      - "tests/**"
+      - "start.sh"
+      - "pyproject.toml"
+      - ".github/workflows/tests.yml"
+  push:
+    branches: [main]
+    paths:
+      - "fusion_speech/**"
+      - "tests/**"
+      - "start.sh"
+      - "pyproject.toml"
+      - ".github/workflows/tests.yml"
+
+# fusion#2 CI retrofit: cancel superseded runs grouped by ref.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          # Dependency cache keyed on the manifest hash (no lockfile in this
+          # repo; pyproject.toml is the manifest of record).
+          cache: pip
+          cache-dependency-path: pyproject.toml
+      - name: System audio library
+        run: sudo apt-get update && sudo apt-get install -y libportaudio2
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[test]" fusion-core
+      - name: Lint
+        run: ruff check fusion_speech tests
+      - name: Test (offline, no model load)
+        env:
+          FUSION_MLX_API_KEY: ci-dummy
+        run: pytest tests/ -q

@@ -62,12 +62,18 @@ async def test_f2_fail_closed_rejects_unverified_peer(short_sock_dir):
     server = await asyncio.start_unix_server(_cb, path=sock_path)
     try:
         reader, writer = await asyncio.open_unix_connection(sock_path)
-        writer.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "speech.ping"}).encode() + b"\n")
-        await writer.drain()
-        # server should close the connection without responding
+        # The server may close before the client finishes writing (Linux closes
+        # fast; macOS races the other way) — a reset/broken pipe IS the
+        # rejection, same as an immediate EOF. Treat all three as "no response".
         try:
-            data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
-        except TimeoutError:
+            writer.write(json.dumps({"jsonrpc": "2.0", "id": 1, "method": "speech.ping"}).encode() + b"\n")
+            await writer.drain()
+            # server should close the connection without responding
+            try:
+                data = await asyncio.wait_for(reader.read(4096), timeout=2.0)
+            except TimeoutError:
+                data = b""
+        except (ConnectionResetError, BrokenPipeError):
             data = b""
         assert data == b"", f"unverified peer got a response: {data!r}"
         assert dispatched == [], "handler ran despite failed peer check"
