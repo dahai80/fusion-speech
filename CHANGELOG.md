@@ -7,7 +7,7 @@ doc_type: changelog
 title: { zh: "变更日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.1.7
+version: 0.1.8
 updated: 2026-11-07
 owner: "@dahai"
 source_of_truth:
@@ -23,6 +23,19 @@ milestone-by-milestone history (M1-M7, hardening passes) lives in README.md
 Keep-a-Changelog format.
 
 ## [Unreleased]
+
+## [0.1.8] - 2026-11-16
+
+### Added
+- Offline test CI (PR #10, fusion#2 CI retrofit): `tests` workflow running
+  `ruff check` + `pytest` (no model load) with concurrency cancel grouped by
+  ref, pip cache keyed on the manifest, and path filters so docs-only PRs
+  skip tests. `docs` workflow gained the same concurrency guard.
+
+### Fixed
+- `test_f2_fail_closed_rejects_unverified_peer` handles the server closing
+  before the client's write completes (Linux race): a reset/broken pipe is
+  treated as the rejection, same as an immediate EOF.
 
 ## [0.1.7] - 2026-11-07
 

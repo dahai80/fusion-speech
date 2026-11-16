@@ -600,5 +600,9 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
 - **0.1.7** — fusion docs-system v1.1 adoption (PR #8): six-page docs set,
   `CHANGELOG.md`, 12-key frontmatter + CI validation (`ci/validate_docs.py`).
   Wake R2 download test now skips when the optional `[audio]` extra is absent.
+- **0.1.8** — offline test CI (PR #10, fusion#2 retrofit): `tests` workflow
+  (ruff + pytest, no model load) with concurrency cancel, pip cache, path
+  filters. F2 fail-closed test hardened against a Linux close-before-write
+  race.
 
 License: Apache-2.0.
