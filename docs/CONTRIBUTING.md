@@ -84,8 +84,8 @@ model weights and the `/v1/audio/*` endpoints on `localhost:11434`.
 The daemon reads the fusion-mlx bearer key from `FUSION_MLX_API_KEY` (or
 fusion-mlx's `settings.json`). If `./start.sh doctor` reports an unreachable
 audio lane, set `FUSION_MLX_API_KEY=<your-key>` for local dev. Note: a stale
-`<your-key>` may leak from `~/.zshrc` and 401 against fusion-mlx — export
-the working key explicitly in that case.
+key lingering in shell startup files (e.g. `~/.zshrc`) can 401 against
+fusion-mlx — export the working key explicitly in that case.
 
 Logs go to `~/.fusion-speech/logs/` (`FUSION_SPEECH_LOG_DIR`). Runtime state
 (start time, restart count) persists at `~/.fusion-speech/run/state.json`.

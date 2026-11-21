@@ -59,7 +59,7 @@ FUSION_SPEECH_REAL_LOAD=1 FUSION_MLX_API_KEY=<your-key> \
 Notes:
 
 - `asyncio_mode = "auto"` — async tests need no `@pytest.mark.asyncio`.
-- fusion-mlx API keys rotate — the env var value goes stale with no code change. When tests 401 against fusion-mlx, verify the live key with `curl -H "Authorization: Bearer <key>" http://localhost:11434/v1/models` and export it explicitly (working key as of 2026-10-24: `<your-key>`; `<your-key>` now 401s).
+- fusion-mlx API keys rotate — the env var value goes stale with no code change. When tests 401 against fusion-mlx, verify the live key with `curl -H "Authorization: Bearer <key>" http://localhost:11434/v1/models` and export it explicitly (keys rotate; the live value lives in fusion-mlx `~/.fusion-mlx/settings.json` `auth.api_key`).
 - Model downloads use mirror `HF_MIRROR=https://hf-mirror.com`; cache `~/.fusion-mlx/models`.
 - Inference-path changes (STT/TTS bridge, streaming, playback) must be verified real-load — never mock model output and claim done.
 
