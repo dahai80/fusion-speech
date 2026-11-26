@@ -7,8 +7,8 @@ doc_type: changelog
 title: { zh: "变更日志", en: "Changelog" }
 audience: engineer
 status: draft
-version: 0.1.8
-updated: 2026-11-07
+version: 0.1.9
+updated: 2026-11-26
 owner: "@dahai"
 source_of_truth:
   - CHANGELOG.md
@@ -23,6 +23,13 @@ milestone-by-milestone history (M1-M7, hardening passes) lives in README.md
 Keep-a-Changelog format.
 
 ## [Unreleased]
+
+## [0.1.9] - 2026-11-26
+
+### Changed
+- Cleared the ruff lint stockpile: 25 violations -> 0, all auto-fixes
+  (PEP 585/604 typing modernization, redundant open modes) confined to
+  `ci/validate_docs.py` (PR #13, closes #12; resolves #11).
 
 ## [0.1.8] - 2026-11-16
 

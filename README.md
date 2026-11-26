@@ -604,5 +604,7 @@ Verified: 147 tests green (`tests/test_wave5.py`, `tests/test_config_validation.
   (ruff + pytest, no model load) with concurrency cancel, pip cache, path
   filters. F2 fail-closed test hardened against a Linux close-before-write
   race.
+- **0.1.9** — lint debt cleared (PR #13): ruff 25 -> 0, auto-fixes confined
+  to `ci/validate_docs.py`. No runtime change.
 
 License: Apache-2.0.
